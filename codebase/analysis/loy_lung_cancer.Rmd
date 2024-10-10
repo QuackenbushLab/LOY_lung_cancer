@@ -1,0 +1,2042 @@
+---
+title: "LOY in lung cancer"
+author: "Jonas Fischer"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+
+# LOY analysis in lung cancer
+
+This manuscript performs the main analyses steps in the presented study on "Selective loss of Y chromosomes in lung adenocarcinoma drives modulation of the tumor immune environment through cancer/testis antigens".
+
+NOTE: To download all necessary data, please refer to the README.txt in the data folder. Due to size and privacy restrictions, most sequencing related files can not be shipped within this repository.
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(recount3)
+library(recount)
+library(Seurat)
+library(biomaRt)
+library(ggplot2)
+library(ggthemes)
+library(viridis)
+library(ggpubr)
+library(classInt)
+library(TCGAbiolinks)
+library(GenomicDataCommons)
+library(immunedeconv)
+library(ggpmisc)
+library(readxl)
+library(fgsea)
+library(BioNet)
+library(dplyr)
+library(igraph)
+library(stringr)
+organism <- "org.Hs.eg.db"
+library(organism, character.only = TRUE)
+library(clusterProfiler) 
+
+## define plotting functions
+corr_plots <- function(PC, Val, ylab="Value", subset=NA, color=NA)
+{
+  if (anyNA(subset))
+  {
+    subset <- 1:length(PC)
+  }
+  corr_pear <- round(cor(PC[subset], Val[subset], use="complete.obs", method="pearson"), digits=3)
+  corr_spear <- round(cor(PC[subset], Val[subset], use="complete.obs", method="spearman"), digits=3)
+  if (sum(is.na(color[subset]) > 0))
+  {
+    ggTCGA <- ggplot(data.frame(PC=PC, X=Val)[subset,], aes(x=PC, y=X)) + theme_minimal()
+  } else {
+    
+    ggTCGA <- ggplot(data.frame(PC=PC, X=Val, color=color)[subset,], aes(x=PC, y=X, color=color)) + theme_minimal()
+  }
+  ggTCGA <- ggTCGA + geom_point(size=1, alpha=.7) + labs(y=ylab) + scale_color_viridis()
+  ggTCGA <- ggTCGA + annotate("text", x = (min(PC[subset], na.rm=T) + 0.6*(max(PC[subset], na.rm=T) - min(PC[subset], na.rm=T))), y = max(Val[subset], na.rm=T) , label = paste0("Pearson: ", corr_pear), size=6)
+  ggTCGA <- ggTCGA + annotate("text", x = (min(PC[subset], na.rm=T) + 0.6*(max(PC[subset], na.rm=T) - min(PC[subset], na.rm=T))), y = min(Val[subset], na.rm=T) + 0.95*(max(Val[subset], na.rm=T) -  min(Val[subset], na.rm=T)), label = paste0("Spearman: ", corr_spear), size=6)
+  ggTCGA <- ggTCGA + theme(legend.title=element_blank(),
+                           legend.key.size=unit(10, 'mm'),
+                           legend.text = element_text(size=18))
+  return(ggTCGA)
+}
+```
+
+### Trajectory of Y loss in LUAD
+
+## TCGA data preprocessing
+
+We download LUAD from TCGA reprocessed through recount3 along with corresponding healthy lung tissue from GTEx.
+
+All individual steps of gene and sample filtering are annotated in the code, including separation of adjacent normal samples, filtering for primary tumor samples, removing genes with zero expression in either GTEx or TCGA and filtering for protein-coding genes, and removing duplicates, keeping the sample with highest sequencing depth.
+
+
+```{r TCGA preprocessing}
+cancer <- "LUAD"
+tissue <- "LUNG"
+
+
+setwd(paste0("../data/",cancer,"/"))
+
+## Download data and create the RSE object
+GTEx_lung <- recount3::create_rse_manual(
+  project = tissue,
+  project_home = "data_sources/gtex",
+  organism = "human",
+  annotation = "gencode_v26",
+  type = "gene"
+)
+TCGA_lung <- recount3::create_rse_manual(
+  project = cancer,
+  project_home = "data_sources/tcga",
+  organism = "human",
+  annotation = "gencode_v26",
+  type = "gene"
+)
+
+
+## get all the annotations and metadata as data frame
+info_samples_tcga <- as.data.frame(colData(TCGA_lung))
+info_genes_tcga <- as.data.frame(rowRanges(TCGA_lung))
+info_genes_tcga$gene_id_nover <- sapply(info_genes_tcga$gene_id, function(x){strsplit(x, '.', fixed=T)[[1]][1]})
+
+## Compute TPMs
+assays(GTEx_lung)$counts <- recount3::transform_counts(GTEx_lung)
+assays(GTEx_lung)$TPM <- recount::getTPM(GTEx_lung)
+
+assays(TCGA_lung)$counts <- recount3::transform_counts(TCGA_lung)
+assays(TCGA_lung)$TPM <- recount::getTPM(TCGA_lung)
+
+
+## Obtain separate dataset for adjacent normal
+TCGA_lung_normal <- log(assays(TCGA_lung)$TPM[,info_samples_tcga$tcga.cgc_sample_sample_type == "Solid Tissue Normal"] + 1)
+info_samples_tcga_normal <- info_samples_tcga[info_samples_tcga$tcga.cgc_sample_sample_type == "Solid Tissue Normal",]
+
+sex_tcga_normal <- TCGA_lung@colData$tcga.gdc_cases.demographic.gender[info_samples_tcga$tcga.cgc_sample_sample_type == "Solid Tissue Normal"]
+
+
+
+## filter for primary tumor samples
+if (cancer == "LAML"){
+  
+  tumor_only_idcs <- info_samples_tcga$tcga.cgc_sample_sample_type == "Primary Blood Derived Cancer - Peripheral Blood"
+} else {
+  tumor_only_idcs <- info_samples_tcga$tcga.cgc_sample_sample_type == "Primary Tumor"
+}
+tumor_only_idcs[is.na(tumor_only_idcs)] <- F
+info_samples_tcga <- info_samples_tcga[tumor_only_idcs,]
+TCGA_lung <- TCGA_lung[,tumor_only_idcs]
+
+expression_all <- cbind(assays(GTEx_lung)$TPM,assays(TCGA_lung)$TPM)
+## Throw out only genes with zero expression in either GTEx or TCGA and filter for protein-coding genes
+keep <- (rowSums(assays(TCGA_lung)$TPM) > 0)# & (info_genes_tcga$gene_type == "protein_coding")
+expression_filtered <- expression_all[keep,]
+
+
+## remove duplicates based on sequencing depth
+sample_barcodes <- sapply(info_samples_tcga$tcga.tcga_barcode, substr, 1, 12)
+seq_depth <- colSums(assays(TCGA_lung)$counts[keep,])
+duplicate_throwout <- rep(NA, ncol(assays(TCGA_lung)$TPM))
+for (idx in 1:ncol(assays(TCGA_lung)$TPM))
+{
+  if (is.na(duplicate_throwout[idx]))
+  {
+    ## find all vials and replicates of current sample
+    rep_idcs <- sample_barcodes[idx] == sample_barcodes
+    ## get those with highest seq depth
+    max_sample_idx <- which.max(seq_depth * rep_idcs)
+    ## throw out all but maximum one
+    duplicate_throwout[rep_idcs] <- T
+    duplicate_throwout[max_sample_idx] <- F
+  }
+}
+
+# Filtered TPM matrices
+GTEx_TPM_filtered_ge <- log(expression_filtered[,1:ncol(assays(GTEx_lung)$TPM)]+1)
+rownames(GTEx_TPM_filtered_ge) <- rownames(expression_filtered)
+colnames(GTEx_TPM_filtered_ge) <- colnames(assays(GTEx_lung)$TPM)
+TCGA_TPM_filtered_ge = log(expression_filtered[,-(1:ncol(assays(GTEx_lung)$TPM))]+1)[,!duplicate_throwout]
+rownames(TCGA_TPM_filtered_ge) <- rownames(expression_filtered)
+colnames(TCGA_TPM_filtered_ge) <- info_samples_tcga$tcga.tcga_barcode[!duplicate_throwout]
+TCGA_lung_normal <- TCGA_lung_normal[keep,]
+
+info_samples_tcga <- info_samples_tcga[!duplicate_throwout,]
+
+## sex of sample donors
+sex_tcga <- TCGA_lung@colData$tcga.gdc_cases.demographic.gender[!duplicate_throwout]
+sex_gtex <- ifelse(GTEx_lung@colData@listData$gtex.sex == 1, "male", "female")
+
+```
+
+
+## A trajectory of chromosome Y
+
+We compute a simple PCA based on the expression of Y chromosome genes in TCGA.
+As comparison, we consider the same analysis in adjacent normal as well as GTEx healthy tissue.
+
+[Fig.3a,c, Supp. Fig.1c]
+
+
+```{r LOY trajectory}
+
+######################### TCGA tumor #############################
+
+## Y-chromosome genes based data
+chroms <- as.data.frame(rowRanges(TCGA_lung))$seqnames[keep]
+
+# remove PAR genes by hand. https://www.nature.com/articles/nature03440/tables/1
+# NOTE: in the recount matrix, PAR genes are all mapped to X, so no issues here. The following is more of a sanity check.
+par1 <- c("PLCXD1", "GTPBP6", "PPP2R3B", "SHOX", "CRLF2", "CSF2RA", "IL3RA", "SLC25A6", "ASMTL-AS1",
+          "ASMTL", "P2RY8", "AKAP17A", "ASMT", "DHRSX", "ZBED1", "CD99")
+par2 <- c("SPRY3", "VAMP7", "IL9R", "WASH6P")
+y_gene_ids <- which(info_genes_tcga$seqnames[keep] == "chrY" &
+                           !(info_genes_tcga$gene_name[keep] %in% par1) & !(info_genes_tcga$gene_name[keep] %in% par2))
+filterSex <- y_gene_ids[!is.na(y_gene_ids)]
+TCGA_TPM_filtered <- TCGA_TPM_filtered_ge[filterSex,]
+GTEx_TPM_filtered <- GTEx_TPM_filtered_ge[filterSex,]
+
+
+## compute PCs on original gene expression data
+pc_data_tcga <- prcomp(t(TCGA_TPM_filtered), scale=F, center=T, rank=3)
+## project data down onto PCs
+projected_tcga <- scale(t(TCGA_TPM_filtered), center=pc_data_tcga$center, scale=pc_data_tcga$scale) %*% pc_data_tcga$rotation 
+## see how much variance was explained
+summary(pc_data_tcga)
+
+proj_tcga_anno <- data.frame(PC1=projected_tcga[,1], PC2=projected_tcga[,2], color=sex_tcga)
+
+## Plot trajectory in primary tumor
+ggTCGA <- ggplot(proj_tcga_anno, aes(x=PC1, y=PC2, color=color, fill=color)) + theme_minimal() + scale_color_viridis_d(begin=.2, end=.7)
+ggTCGA <- ggTCGA + geom_point(size=1, alpha=.7)
+if (max(proj_tcga_anno$PC1) - min(proj_tcga_anno$PC1) > max(proj_tcga_anno$PC2) - min(proj_tcga_anno$PC2))
+{
+  ggTCGA <- ggTCGA + lims(y=c(min(proj_tcga_anno$PC2), min(proj_tcga_anno$PC2) + (max(proj_tcga_anno$PC1) - min(proj_tcga_anno$PC1))))
+} else {
+  ggTCGA <- ggTCGA + lims(x=c(min(proj_tcga_anno$PC1), min(proj_tcga_anno$PC1) + (max(proj_tcga_anno$PC2) - min(proj_tcga_anno$PC2))))
+}
+ggTCGA <- ggTCGA + theme(legend.title=element_blank(),
+                         legend.key.size=unit(10, 'mm'),
+                         legend.text = element_text(size=18))
+print(ggTCGA)
+
+
+#################### TCGA adj. normal #########################
+
+
+# compute PCA, project, and plot
+pc_data_tcga_normal <- prcomp(t(TCGA_lung_normal[filterSex,]), scale=F, center=T, rank=3)
+projected_tcga_normal <- t(TCGA_lung_normal[filterSex,]) %*% pc_data_tcga_normal$rotation
+summary(pc_data_tcga_normal)
+projected_normal <- data.frame(PC1=projected_tcga_normal[,1], PC2=projected_tcga_normal[,2], sex=sex_tcga_normal)
+ggTCGA <- ggplot(projected_normal, aes(x=PC1, y=PC2, color=sex, fill=sex)) + theme_minimal() + scale_color_viridis_d(begin=.2, end=.7)
+ggTCGA <- ggTCGA + geom_point(size=1, alpha=.7) 
+if (max(projected_normal$PC1) - min(projected_normal$PC1) > max(projected_normal$PC2) - min(projected_normal$PC2))
+{
+  ggTCGA <- ggTCGA + lims(y=c(min(projected_normal$PC2), min(projected_normal$PC2) + (max(projected_normal$PC1) - min(projected_normal$PC1))))
+} else {
+  ggTCGA <- ggTCGA + lims(x=c(min(projected_normal$PC1), min(projected_normal$PC1) + (max(projected_normal$PC2) - min(projected_normal$PC2))))
+}
+ggTCGA <- ggTCGA + theme(legend.title=element_blank(),
+                         legend.key.size=unit(10, 'mm'),
+                         legend.text = element_text(size=18))
+print(ggTCGA)
+
+
+
+######################### GTEx #############################
+
+## compute PCA, project, and plot
+pc_data_gtex <- prcomp(t(GTEx_TPM_filtered), scale=F, center=T, rank=3)
+projected_gtex <- scale(t(GTEx_TPM_filtered), center=pc_data_gtex$center, scale=pc_data_gtex$scale) %*% pc_data_gtex$rotation 
+summary(pc_data_gtex)
+proj_gtex_anno <- data.frame(PC1=projected_gtex[,1], PC2=projected_gtex[,2], sex=sex_gtex)
+ggGTEx <- ggplot(proj_gtex_anno, aes(x=PC1, y=PC2, color=sex, fill=sex)) + theme_minimal() + scale_color_viridis_d(begin=.2, end=.7)
+ggGTEx <- ggGTEx + geom_point(size=1, alpha=.7) + lims(y=c(min(proj_gtex_anno$PC2), min(proj_gtex_anno$PC2) + (max(proj_gtex_anno$PC1) - min(proj_gtex_anno$PC1))))
+ggGTEx <- ggGTEx + theme(legend.title=element_blank(),
+                         legend.key.size=unit(10, 'mm'),
+                         legend.text = element_text(size=18))
+print(ggGTEx)
+
+
+
+compute_LOY <- function(PCA_dat, sex_dat)
+{
+  if (sum(sex_dat == 'female') > 1)
+  {
+    grav_center_female <- colMeans(PCA_dat[sex_dat == 'female',])
+  } else {
+    grav_center_female <- PCA_dat[sex_dat == 'female',]
+  }
+  grav_center_male <- colMeans(PCA_dat[sex_dat == 'male',])
+  LOY_metric <- apply(PCA_dat, 1, function(x) {(x - grav_center_female) %*% (grav_center_male - grav_center_female)})
+  norm_fact <- LOY_metric[which.max(abs(LOY_metric))]
+  LOY_metric <- 1 - (LOY_metric/norm_fact)
+  return(LOY_metric)
+}
+LOY_metric <- compute_LOY(projected_tcga, sex_tcga)
+```
+
+
+
+Additional information: PC1-3 plot for TCGA LUAD; correlation of pc-LOY with RPS4Y1 expression
+
+[Fig. 4a, Supp. Fig. 4a,b]
+
+```{r further PC analysis}
+
+## Generate 3D plot for first three PCs
+library(plotly)
+
+plot_ly(x=projected_tcga[,1], y=projected_tcga[,2], z=projected_tcga[,3], type="scatter3d", mode="markers", color=LOY_metric, size=2)
+
+## Generate scree plot
+pc_data_tcga_20 <- prcomp(t(TCGA_TPM_filtered), scale=F, center=T, rank.=20)
+
+var_explained <- summary(pc_data_tcga_20)$importance[2,1:20]
+gg <- ggplot(data.frame(PC=1:length(var_explained), var_explained=var_explained), aes(x=PC, y=var_explained)) + 
+  geom_line(lwd=.5) + 
+  geom_point(size=.5) +
+  xlab("Principal Component") + 
+  ylab("Variance Explained") +
+  ggtitle("Scree Plot") +
+  ylim(0, 1) +
+  theme_minimal()
+print(gg)
+
+
+## Correlation between pcLOY and RPS4Y1 gene expression
+print("Correlation between pc-LOY and RPS4Y1 expression")
+cor_rps4y1 <- cor(TCGA_TPM_filtered_ge[info_genes_tcga$gene_name[keep] %in% c('RPS4Y1'), sex_tcga=='male'], LOY_metric[sex_tcga=='male'])
+cort_rps4y1 <- cor.test(TCGA_TPM_filtered_ge[info_genes_tcga$gene_name[keep] %in% c('RPS4Y1'), sex_tcga=='male'], LOY_metric[sex_tcga=='male'], method='pearson')
+
+
+gg <- ggplot(data.frame(RPS4Y1=TCGA_TPM_filtered_ge[info_genes_tcga$gene_name[keep] %in% c('RPS4Y1'), sex_tcga=='male'],
+                 LOY=LOY_metric[sex_tcga=='male']),
+             aes(x=LOY, y=RPS4Y1)) +
+  geom_point(size=.5, alpha=.7) + theme_minimal() +
+  annotate("text", x = .75, y = 6.5 , label = paste0("Pearson: ", signif(cor_rps4y1,2)), size=5) +
+  annotate("text", x = .75, y = 6.2 , label = paste0("p-value: ", signif(cort_rps4y1$p.value,2)), size=5)
+
+print(gg)
+
+```
+
+
+## GSOR of LOY
+
+For the interested researcher a GSOR of the highest correlated genes with LOY, among others yields typical cancer related pathways (cell cycle, DNA replication, cellular senescence) and p53
+
+```{r gsor bulk}
+
+cors <- setNames(sapply(which(chroms != 'chrY' & chroms != 'chrX'), function (geneIdx)
+{
+  suppressWarnings(cor(LOY_metric[sex_tcga == "male"], TCGA_TPM_filtered_ge[geneIdx, sex_tcga == "male"], method = 'pearson'))
+}
+), info_genes_tcga$gene_id_nover[keep][chroms != 'chrY' & chroms != 'chrX'])
+
+k <- 1000
+topk_idcs <- order(cors, decreasing = T)[1:k]
+
+
+mart <- useDataset("hsapiens_gene_ensembl", useMart("ensembl"))
+library(clusterProfiler)
+genesMap <- getBM(
+  filters="ensembl_gene_id",
+  attributes=c("ensembl_gene_id", "entrezgene_id"),
+  uniqueRows = T,
+  useCache=F,
+  values=names(cors)[topk_idcs],
+  mart=mart)
+genesMapFull <- getBM(
+  filters="ensembl_gene_id",
+  attributes=c("ensembl_gene_id", "entrezgene_id"),
+  uniqueRows = T,
+  useCache=F,
+  values=info_genes_tcga$gene_id_nover[keep],
+  mart=mart)
+keggAnalysis <- enrichKEGG(genesMap[,2],
+                           organism     = 'hsa',
+                           pvalueCutoff = .05,
+                           universe = as.character(genesMapFull[,2]),
+                           minGSSize = 5)
+as.data.frame(keggAnalysis)$Description
+goAnalysis <- enrichGO(genesMap[,2],
+                       'org.Hs.eg.db',
+                       ont="BP",
+                       pvalueCutoff = .05,
+                       universe = as.character(genesMapFull[,2]),
+                       minGSSize = 5)
+as.data.frame(goAnalysis)$Description
+
+
+```
+
+
+## loss of Y expression along the trajectory
+
+We show that the trajectory is associated with an overall depletion of Y expression as given by the coverage in RNA-seq, and compare against autosomal coverage (hypothesis: overall depletion of expression or loss of chromosomal fragments) and chromosome 21 coverage (hypothesis: random loss of small chromosomes or gene deserts).
+
+[Supp. Fig. 2a,b]
+
+```{r coverage comparison}
+
+## Trajectory given by PC versus Y and autosomal coverage
+counts <- assays(TCGA_lung)$counts[keep,!duplicate_throwout]
+read_cov_y <- colSums(counts[chroms == "chrY",])
+read_cov_auto <- colSums(counts[chroms != "chrX" & chroms != "chrY" & chroms != "chrM",])
+read_cov_auto <- read_cov_auto/max(read_cov_auto, na.rm=T)
+
+corr_plots(LOY_metric, read_cov_y, ylab="Y chromosome coverage", subset=which(sex_tcga=="male"), color=read_cov_auto) + labs(x="LOY")
+
+## Also test chr 21 because also so small and gene deserted
+read_cov_small <- colSums(counts[chroms == "chr21",])
+read_cov_small[sex_tcga == "female"] <- NA
+read_cov_small <- read_cov_small/max(read_cov_small, na.rm=T)
+
+corr_plots(LOY_metric, read_cov_small, ylab="Chromosome 21 coverage", subset=which(sex_tcga=="male")) + labs(x="LOY")
+
+
+```
+
+## LOY trajectory is not driven by common covariates
+
+We next analyze the role of covariates for the observed LOY trajectory, in particular, smoking, age, batch ID, and purity estimates.
+
+[Supp. Fig. 1d,e,f;2c,d]
+
+```{r covariate analysis}
+## look at association with smoking
+corr_plots(LOY_metric,
+           info_samples_tcga$tcga.gdc_cases.exposures.cigarettes_per_day,
+           ylab="Cigarettes per day",
+           subset=which(sex_tcga == "male")) + labs(x="LOY")
+corr_plots(LOY_metric,
+           info_samples_tcga$tcga.gdc_cases.exposures.years_smoked,
+           ylab="Years smoked",
+           subset=which(sex_tcga == "male")) + labs(x="LOY")
+
+## and age
+corr_plots(LOY_metric, info_samples_tcga$tcga.gdc_cases.diagnoses.age_at_diagnosis, ylab="Age at diagnosis (days)", subset=which(sex_tcga=="male")) + labs(x="LOY")
+
+## and batch ID
+ggTCGA <- ggplot(data.frame(LOY=LOY_metric,
+                            batch=as.factor(info_samples_tcga$tcga.cgc_case_batch_number))[sex_tcga == "male",],
+                 aes(x=LOY, y=batch)) + theme_minimal()
+ggTCGA <- ggTCGA + geom_point(size=1)
+print(ggTCGA)
+## and purity
+## use precomputed data from Supp. Data 1 in https://www.nature.com/articles/ncomms9971#Sec14
+## if xlsx file downloaded from paper, remove first three lines that are comments about the actual table to obtain csv
+purity_data <- read.csv("../data/purityscores_aran_15_natcom_suppdat1.csv", header=T)
+
+## match to our data
+dat <- purity_data[match(sapply(colnames(TCGA_TPM_filtered_ge),substr,1,16), purity_data[,1]),3:7]
+print(head(dat))
+corr_plots(LOY_metric, dat$ESTIMATE, ylab="Purity given by ESTIMATE", subset=which(sex_tcga == "male")) + labs(x="LOY")
+corr_plots(LOY_metric, dat$ABSOLUTE, ylab="Purity given by ABSOLUTE", subset=which(sex_tcga == "male")) + labs(x="LOY")
+corr_plots(LOY_metric, dat$CPE, ylab="Purity given by CPE", subset=which(sex_tcga == "male")) + labs(x="LOY")
+
+
+print(cor.test(info_samples_tcga$tcga.gdc_cases.diagnoses.age_at_diagnosis[sex_tcga=='male'], LOY_metric[sex_tcga=='male'], method='pearson'))
+print(cor.test(info_samples_tcga$tcga.gdc_cases.exposures.cigarettes_per_day[sex_tcga=='male'], LOY_metric[sex_tcga=='male'], method='pearson'))
+print(cor.test(info_samples_tcga$tcga.gdc_cases.exposures.years_smoked[sex_tcga=='male'], LOY_metric[sex_tcga=='male'], method='pearson'))
+print(cor.test(LOY_metric[sex_tcga=='male'], dat$ESTIMATE[sex_tcga=='male'], method='pearson'))
+```
+
+
+
+## The role of cancer testis antigenes in the trajectory of LOY
+
+Cancer testis (CT) antigens play a decisive role in human cancer. Based on the annotated genes from the CT antigens database (https://www.hsls.pitt.edu/obrc/index.php?page=URL1231952822), we predict the LOY trajectory to astonishing accuracy based on a simple least squares model.
+Through annotated motif matches for Y chromosome encoded TFs in the promoter regions of CT genes from GRAND (https://granddb.s3.us-east-2.amazonaws.com/tissues/motif/tissues_motif.txt), we highlight a connection between LOY and regulation of (non-Y) CT antigens.
+
+
+```{r CTA analysis}
+ct_genes <- read.table("../data/cancer_testis_database_genes.csv", header=F, sep=',', nrow=275)
+ct_genes <- ct_genes$V2[!grepl('^Y', ct_genes$V3)]
+
+ct_genes_idcs <- match(ct_genes, info_genes_tcga$gene_name[keep])
+# remove genes with no match
+remNA <- is.na(ct_genes_idcs)
+ct_genes <- ct_genes[!remNA]
+ct_genes_idcs <- ct_genes_idcs[!remNA]
+# reorder to match gene ordering in table
+ordi <- order(ct_genes_idcs)
+ct_genes <- ct_genes[ordi]
+ct_genes_idcs <- ct_genes_idcs[ordi]
+
+
+m <- lm(LOY_metric[which(sex_tcga == "male")] ~ t(TCGA_TPM_filtered_ge[intersect(which(chroms != "chrY"), ct_genes_idcs), which(sex_tcga == "male")]))
+corr_plots(LOY_metric[which(sex_tcga == "male")], m$fitted.values, ylab="Fitted PC based on CT gene expression")
+
+gg <- ggplot(data.frame(LOY=LOY_metric[sex_tcga == "male"], CTA_fit=m$fitted.values), aes(x=LOY, y=CTA_fit)) +
+  theme_minimal() +
+  geom_point(size=.5, alpha=.8) +
+  stat_poly_line() +
+  stat_poly_eq()
+print(gg)
+
+
+
+## TFs on Y chromosomes that have binding sites to these testis genes
+motifs <- read.table("../data/tissues_motif_GRAND.txt", sep="\t", header=F)
+motifs_YtoTestis <- motifs[motifs[,1] %in% info_genes_tcga$gene_name[which(info_genes_tcga$gene_id %in% rownames(TCGA_TPM_filtered))],]
+## remove version number for comparison
+ct_all_short <- sapply(strsplit(rownames(TCGA_TPM_filtered_ge[intersect(which(chroms != "chrY"), ct_genes_idcs),]), '.', fixed=T), function(x){x[1]})
+
+
+## check all testis genes for binding
+YToTestis_binding <- motifs_YtoTestis[motifs_YtoTestis[,2] %in% ct_all_short,]
+YToTestis_binding <- YToTestis_binding[YToTestis_binding[,3] == 1,]
+print(YToTestis_binding)
+write.table(YToTestis_binding, file='../data/YToTestis_TFBinding.tsv', sep = '\t', quote=F, row.names = F, col.names=F)
+## get gene names of CT antigenes that have binding site for Y TFs
+info_genes_tcga$gene_name[sapply(strsplit(info_genes_tcga$gene_id, '.', fixed=T), function(x){x[1]}) %in% motifs_YtoTestis[motifs_YtoTestis[,2] %in% ct_all_short, 2][motifs_YtoTestis[motifs_YtoTestis[,2] %in% ct_all_short,3] == 1]]
+
+
+print(summary(m))
+```
+
+
+## Immune cell makeup is predictive of LOY
+
+Due to the interaction of CTAs with the immune environment, we further investigate whether there is a link between the TIME and loss of Y, looking at predictive power of immune cell composition to LOY.
+
+[Supp. Fig. 4c]
+
+```{r TIME analysis}
+
+exp_matrix_tcga <- exp(TCGA_TPM_filtered_ge)-1
+colnames(exp_matrix_tcga) <- info_samples_tcga$tcga.tcga_barcode
+gene_idx <- match(rownames(exp_matrix_tcga), info_genes_tcga$gene_id)
+rownames(exp_matrix_tcga) <- info_genes_tcga$gene_name[gene_idx]
+
+quantiseq_tcga <- as.data.frame(immunedeconv::deconvolute(exp_matrix_tcga, "quantiseq"))
+
+corr_plots(LOY_metric, as.numeric(quantiseq_tcga[1,-1]), ylab="Quantiseq B cell estimate", subset=which(sex_tcga=="male"))
+corr_plots(LOY_metric, as.numeric(quantiseq_tcga[2,-1]), ylab="Quantiseq M1 cell estimate", subset=which(sex_tcga=="male"))
+corr_plots(LOY_metric, as.numeric(quantiseq_tcga[3,-1]), ylab="Quantiseq M2 cell estimate", subset=which(sex_tcga=="male"))
+corr_plots(LOY_metric, as.numeric(quantiseq_tcga[6,-1]), ylab="Quantiseq NK cell estimate", subset=which(sex_tcga=="male"))
+corr_plots(LOY_metric, as.numeric(quantiseq_tcga[7,-1]), ylab="Quantiseq CD4+ T cell estimate", subset=which(sex_tcga=="male"))
+corr_plots(LOY_metric, as.numeric(quantiseq_tcga[8,-1]), ylab="Quantiseq CD8+ T cell estimate", subset=which(sex_tcga=="male"))
+corr_plots(LOY_metric, as.numeric(quantiseq_tcga[9,-1]), ylab="Quantiseq Treg cell estimate", subset=which(sex_tcga=="male"))
+corr_plots(LOY_metric, as.numeric(quantiseq_tcga[11,-1]), ylab="Quantiseq unchar. cell estimate", subset=which(sex_tcga=="male"))
+
+## Are qunatiseq immune cell fractions predictive of PC?
+quantiseq_mat <- t(as.matrix(quantiseq_tcga[1:10,-1]))
+colnames(quantiseq_mat) <- quantiseq_tcga[1:10,1]
+quantiseq_mat <- quantiseq_mat[colnames(quantiseq_tcga[,-1]) %in% colnames(TCGA_TPM_filtered_ge[,sex_tcga == "male"]),]
+m <- lm(LOY_metric[sex_tcga == "male"] ~ quantiseq_mat)
+corr_plots(LOY_metric[which(sex_tcga == "male")], m$fitted.values, ylab="LOY fit based on Quantiseq immune cell estimates")
+
+print(summary(m))
+
+## make imune cell forest plots
+library(dplyr)
+library(ggplot2)
+library(forcats)
+
+res <- as.data.frame(summary(m)$coefficients)
+rownames(res) <- c('Intercept', 'B cells', 'Macrophage M1', 'Macrophage M2',
+                   'Monocytes', 'Neutrophil', 'NK cells', 'CD4+ T cells',
+                   'CD8+ T cells', 'Tregs', 'Myeloid dendritic cells')
+res$CellType <- rownames(res)
+colnames(res)[2:4] <- c('SE','t','p_value')
+
+myorder <- order(res$Estimate)
+forest <- res %>%
+  mutate(CellType = reorder(CellType, Estimate)) %>% 
+  arrange(-Estimate) %>%
+  ggplot(aes(x=CellType, y=Estimate, ymin=Estimate-1.96*SE, ymax=Estimate+1.96*SE)) + 
+  theme_minimal() +
+  geom_pointrange(lwd=0.8) + 
+  geom_hline(aes(yintercept = 0), lty=2) +
+  xlab("") + ylab("Multiple Linear Regression Coefficient") +
+  guides(fill = guide_legend(reverse = TRUE)) +
+  geom_text(aes(label=signif(p_value, 2)), vjust = 'left', hjust='bottom', size=4,
+            nudge_x = 0.1, nudge_y = 0.1, color='darkblue') + 
+  #guides(
+  #color = guide_legend(title = "raw p-value: ")) +
+  coord_flip() +  # flip coordinates (puts labels on y axis)
+  theme(axis.title = element_text(face = "bold"),
+        axis.text = element_text(face = "bold", size = 11),
+        strip.text = element_text(face = "bold"),
+        plot.margin = unit(c(1, 1, 1, 1), "lines"),
+        title = element_text(face = "bold", size = 12),
+        strip.text.x = element_blank(),#element_text(face = "bold", size = 12),
+        strip.text.y = element_blank(),
+        legend.text = element_text(face = "bold", size = 12),
+        legend.box = 'vertical') + 
+  labs(title="Immune Cell Composition and LOY")
+
+print(forest)
+
+```
+
+
+
+
+
+
+## A deeper understanding of the LOY trajectory through single cell data
+
+To obtain a deeper understanding of the trajectory of LOY and to avoid confounding through immune cells infiltrating the tumor driving changes observed in the bulk expression, we look at lung adenocarcinoma data from the Human Tumor Atlas Network.
+The processed data is available as Seurat objects through cellxcell (https://cellxgene.cziscience.com/collections/62e8f058-9c37-48bc-9200-e767f318a8ec), separated into epithelial and immune cells.
+Here, we generate pseudobulked samples to get back to patient-level data, but separated into epithelial and immune cells.
+
+[Fig. 3c-e, Supp. Fig. 4d]
+
+
+```{r HTAN LOY}
+pathprefix <- "../data/sc_data/processed/"
+immune_cells <- readRDS(paste0(pathprefix, "lung_immune_rnaseq.rds"))
+epi_cells <- readRDS(paste0(pathprefix, "lung_epithelial_rnaseq.rds"))
+
+epi_cells <- epi_cells[,grepl('epithelial', epi_cells@meta.data$cell_type)]
+
+
+immune_cells_filtered <- GetAssayData(immune_cells, slot='counts')[,immune_cells@meta.data$disease == 'lung adenocarcinoma' &
+                                                                     immune_cells@meta.data$tissue == 'lung']
+epi_cells_filtered <- GetAssayData(epi_cells, slot='counts')[,epi_cells@meta.data$disease != 'normal' &
+                                                               epi_cells@meta.data$tissue == 'lung']
+
+immune_sex <- immune_cells@meta.data$sex[immune_cells@meta.data$disease == 'lung adenocarcinoma' &
+                                           immune_cells@meta.data$tissue == 'lung']
+epi_sex <- epi_cells@meta.data$sex[epi_cells@meta.data$disease != 'normal' &
+                                     epi_cells@meta.data$tissue == 'lung']
+
+immune_donor_ids <- immune_cells@meta.data$donor_id[immune_cells@meta.data$disease == 'lung adenocarcinoma' &
+                                                      immune_cells@meta.data$tissue == 'lung']
+epi_donor_ids <- epi_cells@meta.data$donor_id[epi_cells@meta.data$disease != 'normal' &
+                                                epi_cells@meta.data$tissue == 'lung']
+
+immune_type <- immune_cells@meta.data$author_cell_type[immune_cells@meta.data$disease == 'lung adenocarcinoma' &
+                                                         immune_cells@meta.data$tissue == 'lung']
+
+# compute pseudobulk based on donor ID
+# also works when using normalized data (ie, remove slot='counts' above)
+ids_epi <- unique(epi_donor_ids)
+ids_immune <- unique(immune_donor_ids)
+
+## NOTE: comment in the following block to compute the pseudobulk data for the first time. This takes a lot of time.
+# pseudobulk_immune <- do.call(cbind, lapply(ids_immune, function(id)
+# {
+#   colids <- id == immune_donor_ids
+#   ## if using raw counts, do simple read coverage normalization per cell
+#   rowSums(do.call(cbind, lapply(which(colids), function (i)
+#   {immune_cells_filtered[,i]/sum(immune_cells_filtered[,i])})))/length(which(colids))
+# }
+# ))
+# pseudobulk_epi <- do.call(cbind, lapply(ids_epi, function(id)
+# {
+#   colids <- id == epi_donor_ids
+#   ## if using raw counts, do simple read coverage normalization per cell
+#   rowSums(do.call(cbind, lapply(which(colids), function (i)
+#   {epi_cells_filtered[,i]/sum(epi_cells_filtered[,i])})))/length(which(colids))
+# }
+# ))
+# save(pseudobulk_epi, pseudobulk_immune, file="../data/sc_data/pseudobulk_HTAN_LUAD.Rdata")
+load("../data/sc_data/pseudobulk_HTAN_LUAD.Rdata")
+
+
+## look at epithelial cells
+
+pseudobulk <- pseudobulk_epi
+colnames(pseudobulk) <- ids_epi
+pseudobulk <- pseudobulk
+
+bulksex <- sapply(colnames(pseudobulk), function(id) {epi_cells@meta.data$sex[which(epi_cells@meta.data$donor_id == id)[1]]})
+y_gene_ids <- match(sapply(info_genes_tcga$gene_id, function (name){ strsplit(name, '.', fixed=T)[[1]][1] }), rownames(pseudobulk))
+y_gene_ids <- y_gene_ids[info_genes_tcga$seqnames == "chrY"]
+y_gene_ids <- y_gene_ids[!is.na(y_gene_ids)]
+## Normalize by non-Y cov
+pseudobulk_y <- do.call(cbind, lapply(1:ncol(pseudobulk),function(n)
+{
+  pseudobulk[y_gene_ids,n] / sum(pseudobulk[-y_gene_ids,n], na.rm=T)
+}))
+colnames(pseudobulk_y) <- colnames(pseudobulk)
+
+
+y_gene_ids <- match(sapply(info_genes_tcga$gene_id, function (name){ strsplit(name, '.', fixed=T)[[1]][1] }), rownames(pseudobulk))
+y_gene_ids <- y_gene_ids[info_genes_tcga$seqnames == "chrY" & !(info_genes_tcga$gene_name %in% par1) & !(info_genes_tcga$gene_name %in% par2)]
+y_gene_ids <- y_gene_ids[!is.na(y_gene_ids)]
+pseudobulk_y <- pseudobulk[y_gene_ids,]
+pca_y <- prcomp(t(pseudobulk_y), center=T, scale.=F, rank.=3)
+
+LOY_metric <- compute_LOY(pca_y$x, bulksex)
+
+ggsc <- ggplot(data.frame(PC1=pca_y$x[,1], PC2=pca_y$x[,2], sex=bulksex), aes(x=PC1, y=PC2, color=sex, fill=sex)) + theme_minimal()
+ggsc <- ggsc + geom_point(size=2, alpha=.7) + scale_color_viridis_d(begin=.2, end=.7)
+ggsc <- ggsc + lims(y=c(min(pca_y$x[,2]), min(pca_y$x[,2]) + (max(pca_y$x[,1]) - min(pca_y$x[,1]))))
+ggsc <- ggsc + theme(legend.title=element_blank(),
+                         legend.key.size=unit(10, 'mm'),
+                         legend.text = element_text(size=18))
+print(ggsc)
+
+
+auto_gene_ids <- match(sapply(info_genes_tcga$gene_id, function (name){ strsplit(name, '.', fixed=T)[[1]][1] }), rownames(pseudobulk))
+auto_gene_ids <- auto_gene_ids[info_genes_tcga$seqnames != "chrX" & info_genes_tcga$seqnames != "chrY"]
+auto_gene_ids <- auto_gene_ids[!is.na(auto_gene_ids)]
+# look at counts of Y along PC1
+corr_plots(LOY_metric, colSums(pseudobulk_y), ylab="Coverage of Y", subset=which(bulksex=="male"), color=colSums(pseudobulk[auto_gene_ids,]))
+
+
+## now do PCA for immune cells
+pseudobulk <- pseudobulk_immune
+colnames(pseudobulk) <- ids_immune
+
+bulksex_imm <- sapply(colnames(pseudobulk), function(id) {immune_cells@meta.data$sex[which(immune_cells@meta.data$donor_id == id)[1]]})
+
+pseudobulk_y <- do.call(cbind, lapply(1:ncol(pseudobulk),function(n)
+{
+  pseudobulk[y_gene_ids,n] / sum(pseudobulk[-y_gene_ids,n], na.rm=T)
+}))
+colnames(pseudobulk_y) <- colnames(pseudobulk)
+pca_y_imm <- prcomp(t(pseudobulk_y), center=T, scale.=F, rank.=3)
+
+
+LOY_metric_imm <- compute_LOY(pca_y_imm$x, bulksex_imm)
+
+ggsc <- ggplot(data.frame(PC1=pca_y_imm$x[,1], PC2=pca_y_imm$x[,2], sex=bulksex_imm), aes(x=PC1, y=PC2, color=sex, fill=sex)) + theme_minimal()
+ggsc <- ggsc + geom_point(size=2, alpha=.7) + scale_color_viridis_d(begin=.2, end=.7)
+ggsc <- ggsc + lims(y=c(min(pca_y_imm$x[,2]), min(pca_y_imm$x[,2]) + (max(pca_y_imm$x[,1]) - min(pca_y_imm$x[,1]))))
+print(ggsc)
+
+# look at counts of Y along PC1
+corr_plots(LOY_metric_imm, colSums(pseudobulk_y), ylab="Coverage of Y", subset=which(bulksex_imm=="male"), color=colSums(pseudobulk[auto_gene_ids,]))
+
+
+## How many immune cells do we have in comparison to epithelial?
+pseudobulk_immune_num <- sapply(ids_immune, function(id)
+{
+  colids <- id == immune_donor_ids
+  length(which(colids))
+}
+)
+names(pseudobulk_immune_num) <- ids_immune
+pseudobulk_epi_num <- sapply(ids_epi, function(id)
+{
+  colids <- id == epi_donor_ids
+  length(which(colids))
+}
+)
+names(pseudobulk_epi_num) <- ids_epi
+pseudobulk_immune_num <- pseudobulk_immune_num[match(names(pseudobulk_epi_num), names(pseudobulk_immune_num))]
+ratios <- pseudobulk_epi_num/pseudobulk_immune_num
+
+
+corr_plots(LOY_metric, log10(ratios), ylab="Ratio of epithelial to immune cells", subset=which(bulksex=="male")) +
+  theme(axis.text.y = element_text(size=18),
+        axis.ticks.y = element_line(colour = "black", linewidth = 1),
+        axis.ticks.length.y = unit(8,'pt')
+        )
+
+## check specific immune cells
+pseudobulk_immune_num_bytype <- lapply(unique(immune_type), function(type)
+{
+  celltype_frac <- setNames(sapply(ids_immune, function(id)
+  {
+    colids <- id == immune_donor_ids
+    length(which(immune_type[colids] == type))/(length(which(colids)))
+  }
+  ), ids_immune)
+  celltype_frac[match(names(pseudobulk_epi_num), names(celltype_frac))]
+})
+names(pseudobulk_immune_num_bytype) <- unique(immune_type)
+
+cell_type_plots <- lapply(1:length(pseudobulk_immune_num_bytype), function(i)
+{
+  corr_plots(LOY_metric, pseudobulk_immune_num_bytype[[i]], ylab=names(pseudobulk_immune_num_bytype)[i], subset=which(bulksex=="male"))
+}
+)
+
+invisible(lapply(cell_type_plots, print))
+
+
+
+
+## Check diff exp of CT genes
+# ycov <- sapply(which(epi_sex == "male"), function(i)
+# {
+#   ## y coverage normalized by overall coverage
+#   sum(epi_cells_filtered[y_gene_ids,i])/sum(epi_cells_filtered[,i])
+# }
+# )
+# save(ycov, file="~../data/sc_data/HTAN_ycov.Rdata")
+load("../data/sc_data/HTAN_ycov.Rdata")
+## see where to put the cutoff
+ggplot(data.frame(y=colSums(epi_cells_filtered[y_gene_ids,epi_sex == "male"]), nony=colSums(epi_cells_filtered[-y_gene_ids,epi_sex == "male"]), ycov=ycov), aes(x=ycov)) + theme_minimal() + geom_histogram(bins=200, alpha=.9) +
+  scale_y_log10() + xlim(-0.0001,0.011) + geom_vline(xintercept=0.0004, color="darkred")
+
+yloss <- ycov <= 0.0004
+
+## load gene conv table
+gene_conv <- read.table("../data/annotation/gencode.v32.basic.annotation.gff3", header=F, quote="")[,-c(2,6,8)]
+colnames(gene_conv) <- c("chrom", "type", "start", "stop", "strand", "info")
+gene_conv <- gene_conv[gene_conv$type == "gene",]
+gene_conv$gene_id <- sapply(gene_conv$info, function(x){strsplit(x, ";", fixed=T)[[1]][1]})
+gene_conv$gene_id <- sapply(gene_conv$gene_id, function(x){strsplit(x, "=", fixed=T)[[1]][2]})
+gene_conv$gene_id_nover <- sapply(gene_conv$gene_id, function(x){strsplit(x, ".", fixed=T)[[1]][1]})
+gene_conv$gene_type <- sapply(gene_conv$info, function(x){strsplit(x, ";", fixed=T)[[1]][3]})
+gene_conv$gene_type <- sapply(gene_conv$gene_type, function(x){strsplit(x, "=", fixed=T)[[1]][2]})
+gene_conv <- gene_conv[gene_conv$gene_type == "protein_coding",]
+gene_conv$gene_name <- sapply(gene_conv$info, function(x){strsplit(x, ";", fixed=T)[[1]][4]})
+gene_conv$gene_name <- sapply(gene_conv$gene_name, function(x){strsplit(x, "=", fixed=T)[[1]][2]})
+
+
+epi_exp_filtered <- as.matrix(GetAssayData(epi_cells)[,epi_cells@meta.data$disease != 'normal' &
+                                                        epi_cells@meta.data$tissue == 'lung' &
+                                                        epi_cells@meta.data$sex == 'male'])
+rownames(epi_exp_filtered) <- gene_conv$gene_name[match(rownames(epi_exp_filtered),
+                                                        gene_conv$gene_id_nover)]
+
+
+
+ct_logfoldchange <- rowSums(epi_exp_filtered[rownames(epi_exp_filtered) %in% ct_genes, yloss])/sum(yloss) - rowSums(epi_exp_filtered[rownames(epi_exp_filtered) %in% ct_genes, !yloss])/sum(!yloss)
+
+```
+
+
+## Impact of LOY in epithelial cells on a single-cell level
+
+To better understand the changes that LOY affect on a global expression level, we carry out a Gene Set Enrichment Analysis (GSEA) based on log-fold-changes in expression between cells that lost Y (coverage = 0) and those that did not lose Y (coverage > 0).
+
+[Supp. Fig. 3]
+
+```{r LOY in individual cells}
+
+## Determine Y-loss per cell dependent on non-PAR genes
+y_gene_ids <- match(sapply(info_genes_tcga$gene_id, function (name){ strsplit(name, '.', fixed=T)[[1]][1] }), rownames(epi_cells_filtered))
+y_gene_ids <- y_gene_ids[info_genes_tcga$seqnames == "chrY" & !(info_genes_tcga$gene_name %in% par1) & !(info_genes_tcga$gene_name %in% par2)]
+y_gene_ids <- y_gene_ids[!is.na(y_gene_ids)]
+
+## Compute y coverage. NOTE: This takes a lot of time, comment in when executing this script for the first time.
+# ycov <- sapply(which(epi_sex == "male"), function(i)
+# {
+#   ## y coverage normalized by overall coverage
+#   sum(epi_cells_filtered[y_gene_ids,i])/sum(epi_cells_filtered[,i])
+# }
+# )
+# save(ycov, file="ycov.Rdata")
+load("ycov.Rdata")
+yloss <- ycov == 0
+
+non_y_gene_ids <- match(sapply(info_genes_tcga$gene_id, function (name){ strsplit(name, '.', fixed=T)[[1]][1] }), rownames(GetAssayData(epi_cells)))
+non_y_gene_ids <- non_y_gene_ids[info_genes_tcga$seqnames != "chrY"]
+non_y_gene_ids <- non_y_gene_ids[!is.na(non_y_gene_ids)]
+
+# compute log-foldchange
+epi_exp_filtered <- GetAssayData(epi_cells)[non_y_gene_ids,epi_cells@meta.data$disease != 'normal' &
+                                                            epi_cells@meta.data$tissue == 'lung']
+
+logchange <- rowMeans(epi_exp_filtered[,epi_sex == "male"][,yloss]) - rowMeans(epi_exp_filtered[,epi_sex == "male"][,!yloss])
+
+logchange <- sort(logchange, decreasing=T)
+
+## GSEA
+gse <- gseGO(geneList=logchange, 
+      ont ="BP", 
+      keyType = "ENSEMBL",
+      maxGSSize = 800, 
+      pvalueCutoff = 0.05, 
+      verbose = TRUE,
+      minGSSize = 5,
+      OrgDb = organism)
+
+gse_dat <- as.data.frame(gse)
+#write_csv(gse_dat, "sc_lung_GSEA_LOYvsNLOY_GO.csv")
+
+dotplot(gse, showCategory=10, split=".sign", font.size=6) + facet_grid(.~.sign)
+
+mart <- useDataset("hsapiens_gene_ensembl", useMart("ensembl"))
+genesMap <- getBM(
+  filters="ensembl_gene_id",
+  attributes=c("ensembl_gene_id", "entrezgene_id"),
+  uniqueRows = T,
+  useCache=F,
+  values=names(logchange),
+  mart=mart)
+logchange_kegg <- setNames(logchange, genesMap[!duplicated(genesMap[,1]),2])
+
+gse_kegg <- gseKEGG(logchange_kegg,
+                   organism     = 'hsa',
+                   pvalueCutoff = .05,
+                   minGSSize=5)
+
+dotplot(gse_kegg, showCategory=10, split=".sign", font.size=8) + facet_grid(.~.sign)
+
+```
+
+
+## Consistency of results across datasets
+
+To evaluate whether the same results can be found in different datasets of same type and origin, we consider lung adenocarcinoma data of the Lung Cancer Consortium Singapore (LCCS).
+
+The whole dataset including metadata is available at https://src.gisapps.org/OncoSG_public/study/summary?id=GIS031
+
+
+```{r lccs}
+get_TPM <- function(exp_matrix, gene_lengths)
+{
+  reads_per_kb <- do.call(rbind, lapply(1:nrow(exp_matrix), function(geneIdx)
+  {
+    exp_matrix[geneIdx,]/(gene_lengths[geneIdx]/1000)
+  }))
+  rpk_per_sample_per_mill <- colSums(reads_per_kb, na.rm=T)/1000000
+  tpm <- do.call(cbind, lapply(1:ncol(exp_matrix), function(sampleIdx)
+  {
+    reads_per_kb[,sampleIdx]/rpk_per_sample_per_mill[sampleIdx]
+  }))
+  return(tpm)
+}
+
+remove_version <- function(gene_ids)
+{
+  sapply(gene_ids, function(x) {strsplit(x,'.',fixed=T)[[1]][1]})
+}
+
+
+## load raw read count of tumor and adjacent normal data
+gene_exp_normal_raw <- read.table("../data/LCCS_data/GSK_RSEM_rerun_expCounts_88_Normal.tsv", header=T, sep='\t')
+gene_exp_tumor_raw <- read.table("../data/LCCS_data/GSK_RSEM_rerun_expCounts_172_Tumor.tsv", header=T, sep='\t')
+## genes have same ordering
+gene_info_lccs <- gene_exp_normal_raw[,1:3]
+## filter out weirdly annotated things (e.g. those without start stop)
+gene_exp_normal_raw <- gene_exp_normal_raw[which(gene_info_lccs$Gene.type %in% c("protein-coding") ),-(1:3)]
+gene_exp_tumor_raw <- gene_exp_tumor_raw[which(gene_info_lccs$Gene.type %in% c("protein-coding")),-(1:3)]
+
+gene_info_lccs <- gene_info_lccs[which(gene_info_lccs$Gene.type %in% c("protein-coding")),]
+
+gene_idcs <- match(remove_version(gene_info_lccs$Ensembl.ID), remove_version(info_genes_tcga$gene_id))
+gene_lengths <- abs(info_genes_tcga$end[gene_idcs] - info_genes_tcga$start[gene_idcs])
+
+gene_exp_normal_logtpm <- log(get_TPM(gene_exp_normal_raw, gene_lengths)+1)
+gene_exp_tumor_logtpm <- log(get_TPM(gene_exp_tumor_raw, gene_lengths)+1)
+
+clinical_info <- read.table("../data/LCCS_data/GIS031.clinical.patient.txt", header=T, sep='\t')
+
+sex_lccs_tumor <- clinical_info$GENDER[match(colnames(gene_exp_tumor_raw), clinical_info$PATIENT_ID)]
+sex_lccs_normal <- clinical_info$GENDER[match(colnames(gene_exp_normal_raw), clinical_info$PATIENT_ID)]
+
+## get indices of Y chromosome genes
+ychr_indices <- info_genes_tcga$seqnames[match(remove_version(gene_info_lccs$Ensembl.ID), remove_version(info_genes_tcga$gene_id))] == "chrY"
+ychr_indices[is.na(ychr_indices)] <- F
+
+pc_data_lccs <- prcomp(t(gene_exp_tumor_logtpm[ychr_indices,]), scale=F, center=F, rank=3)
+## project data down onto PCs
+projected_lccs <- scale(t(gene_exp_tumor_logtpm[ychr_indices,]), center=pc_data_lccs$center, scale=pc_data_lccs$scale) %*% pc_data_lccs$rotation 
+## see how much variance was explained
+summary(pc_data_lccs)
+
+
+proj_lccs_anno <- data.frame(PC1=projected_lccs[,1],
+                             PC2=projected_lccs[,2],
+                             sex=sex_lccs_tumor)
+
+LOY_lccs <- compute_LOY(projected_lccs, tolower(sex_lccs_tumor))
+
+## Plot trajectory in primary tumor
+ggLCC <- ggplot(proj_lccs_anno, aes(x=PC1, y=PC2, color=sex, fill=sex)) + theme_minimal() + scale_color_viridis_d(begin=.2, end=.7)
+ggLCC <- ggLCC + geom_point(size=2, alpha=.7) + lims(y=c(min(proj_lccs_anno$PC2), min(proj_lccs_anno$PC2) + (max(proj_lccs_anno$PC1) - min(proj_lccs_anno$PC1))))
+ggLCC <- ggLCC + theme(legend.title=element_blank(),
+                         legend.key.size=unit(10, 'mm'),
+                         legend.text = element_text(size=18))
+ggLCC
+
+
+pc_data_lccs_normal <- prcomp(t(gene_exp_normal_logtpm[ychr_indices,]), scale=F, center=F, rank=3)
+## project data down onto PCs
+projected_lccs_normal <- scale(t(gene_exp_normal_logtpm[ychr_indices,]), center=pc_data_lccs_normal$center, scale=pc_data_lccs_normal$scale) %*% pc_data_lccs$rotation 
+## see how much variance was explained
+summary(pc_data_lccs_normal)
+
+
+proj_lccs_anno_normal <- data.frame(PC1=projected_lccs_normal[,1],
+                             PC2=projected_lccs_normal[,2],
+                             sex=sex_lccs_normal)
+
+## Plot trajectory in adjacent normal
+ggLCC <- ggplot(proj_lccs_anno_normal, aes(x=PC1, y=PC2, color=sex, fill=sex)) + theme_minimal() + scale_color_viridis_d(begin=.2, end=.7)
+ggLCC <- ggLCC + geom_point(size=2, alpha=.7) + lims(y=c(min(proj_lccs_anno_normal$PC2), min(proj_lccs_anno_normal$PC2) + (max(proj_lccs_anno_normal$PC1) - min(proj_lccs_anno_normal$PC1))))
+ggLCC <- ggLCC + theme(legend.title=element_blank(),
+                         legend.key.size=unit(10, 'mm'),
+                         legend.text = element_text(size=18))
+ggLCC
+```
+
+
+Look at Y chromosome coverage and CT antigen prediction quality.
+
+```{r lccs CTA}
+## get all female-looking (partially misannotated) samples
+misanno_tumor <- proj_lccs_anno$PC1 > -2
+## get indices of autosomal genes
+auto_idcs <- !(info_genes_tcga$seqnames[match(remove_version(gene_info_lccs$Ensembl.ID), remove_version(info_genes_tcga$gene_id))] %in% c("chrX", "chrY", "chrM"))
+
+## obtain coverage along Y and along autosomal genes
+y_cov <- colSums(gene_exp_tumor_raw[ychr_indices,])
+auto_cov <- colSums(gene_exp_tumor_raw[auto_idcs,])
+auto_cov <- auto_cov/max(auto_cov, na.rm=T)
+
+y_cov <- y_cov/auto_cov
+
+corr_plots(LOY_lccs, y_cov, ylab="Y gene / autosomal gene coverage", subset=which(proj_lccs_anno$sex == "Male" & !misanno_tumor))
+
+
+
+## Obtain CT genes and match to data
+ct_genes <- read.table("../cancer_testis_database_genes.csv", header=F, sep=',', nrow=275)
+ct_genes <- ct_genes$V2[!grepl('^Y', ct_genes$V3)]
+
+## map to ENSG ids
+ct_genes_ensg <- info_genes_tcga$gene_id[match(ct_genes,
+                                               info_genes_tcga$gene_name)]
+## Get non NA genes
+## also remove version
+ct_genes_ensg <-  remove_version(ct_genes_ensg[!is.na(ct_genes_ensg)])
+
+
+## We need to do regularized fitting because of singularities
+library(glmnet)
+cv_model <- cv.glmnet(t(gene_exp_tumor_logtpm[!ychr_indices & (remove_version(gene_info_lccs$Ensembl.ID) %in% ct_genes_ensg), proj_lccs_anno$sex == "Male" & !misanno_tumor]), LOY_lccs[proj_lccs_anno$sex == "Male" & !misanno_tumor], alpha = 1)
+m <- glmnet(t(gene_exp_tumor_logtpm[!ychr_indices & (remove_version(gene_info_lccs$Ensembl.ID) %in% ct_genes_ensg), proj_lccs_anno$sex == "Male" & !misanno_tumor]), LOY_lccs[proj_lccs_anno$sex == "Male" & !misanno_tumor], alpha = 1, lambda = cv_model$lambda.min)
+
+corr_plots(LOY_lccs[proj_lccs_anno$sex == "Male" & !misanno_tumor], as.vector(t(gene_exp_tumor_logtpm[!ychr_indices & (remove_version(gene_info_lccs$Ensembl.ID) %in% ct_genes_ensg), proj_lccs_anno$sex == "Male" & !misanno_tumor])%*%m$beta + m$a0), ylab="Fitted PC based on CT gene expression")
+
+
+
+```
+
+Predictive power of immune cell makeup to LOY
+
+```{r lccs TIME}
+
+exp_matrix_lccs <- exp(gene_exp_tumor_logtpm[, proj_lccs_anno$sex == "Male" & !misanno_tumor])-1
+rownames(exp_matrix_lccs) <- gene_info_lccs$Gene.symbol
+
+### quantiseq
+quantiseq_lccs <- as.data.frame(immunedeconv::deconvolute(exp_matrix_lccs, "quantiseq"))
+
+
+corr_plots(LOY_lccs[proj_lccs_anno$sex == "Male" & !misanno_tumor], as.numeric(quantiseq_lccs[1,-1]), ylab="Quantiseq B cell estimate", subset=which(sex_tcga=="male"))
+corr_plots(LOY_lccs[proj_lccs_anno$sex == "Male" & !misanno_tumor], as.numeric(quantiseq_lccs[6,-1]), ylab="Quantiseq NK cell estimate", subset=which(sex_tcga=="male"))
+corr_plots(LOY_lccs[proj_lccs_anno$sex == "Male" & !misanno_tumor], as.numeric(quantiseq_lccs[7,-1]), ylab="Quantiseq CD4+ T cell estimate", subset=which(sex_tcga=="male"))
+corr_plots(LOY_lccs[proj_lccs_anno$sex == "Male" & !misanno_tumor], as.numeric(quantiseq_lccs[8,-1]), ylab="Quantiseq CD8+ T cell estimate", subset=which(sex_tcga=="male"))
+corr_plots(LOY_lccs[proj_lccs_anno$sex == "Male" & !misanno_tumor], as.numeric(quantiseq_lccs[9,-1]), ylab="Quantiseq Treg cell estimate", subset=which(sex_tcga=="male"))
+corr_plots(LOY_lccs[proj_lccs_anno$sex == "Male" & !misanno_tumor], as.numeric(quantiseq_lccs[11,-1]), ylab="Quantiseq unchar. cell estimate", subset=which(sex_tcga=="male"))
+
+## Are qunatiseq immune cell fractions predictive of PC?
+quantiseq_mat <- t(as.matrix(quantiseq_lccs[1:10,-1]))
+colnames(quantiseq_mat) <- quantiseq_lccs[1:10,1]
+m <- lm(LOY_lccs[proj_lccs_anno$sex == "Male" & !misanno_tumor] ~ quantiseq_mat)
+corr_plots(LOY_lccs[which(proj_lccs_anno$sex == "Male" & !misanno_tumor)], m$fitted.values, ylab="LOY fit based on Quantiseq immune cell estimates")
+
+print(summary(m))
+
+```
+
+
+## Reproducability of single-cell results across different data
+
+Reproducibility in single cell data of Kim et al.
+
+[Supp. Fig.2e,f; 3b]
+
+```{r sc korea}
+pathprefix <- "../data/LUAD_sc_korea/"
+
+cell_anno <- read.table(paste0(pathprefix, "GSE131907_Lung_Cancer_cell_annotation.txt"), header=T, sep='\t')
+sample_meta <- read.csv(paste0(pathprefix, "GSE131907_Lung_Cancer_Feature_Summary.csv"), header=T)
+exp_data_logtpm <- readRDS(paste0(pathprefix, "GSE131907_Lung_Cancer_normalized_log2TPM_matrix.rds"))
+## expression is rows=gene, columns=cells
+
+## reorder to match expression data
+cell_anno <- cell_anno[match(colnames(exp_data_logtpm), cell_anno$Index),]
+
+lnorm_idcs <- cell_anno$Sample_Origin == "nLung"
+ltumor_idcs <- cell_anno$Sample_Origin == "tLung"
+
+pseudobulk_epi_tumor <- do.call(cbind, lapply(unique(cell_anno$Sample[ltumor_idcs]), function (s)
+{
+  sample_cells <- s == cell_anno$Sample[ltumor_idcs] & cell_anno$Cell_type[ltumor_idcs] %in% c("Epithelial cells", "Endothelial cells")
+  rowMeans(exp_data_logtpm[,ltumor_idcs][, sample_cells])
+}
+))
+colnames(pseudobulk_epi_tumor) <- unique(cell_anno$Sample[ltumor_idcs])
+pseudobulk_epi_normal <- do.call(cbind, lapply(unique(cell_anno$Sample[lnorm_idcs]), function (s)
+{
+  sample_cells <- s == cell_anno$Sample[lnorm_idcs] & cell_anno$Cell_type[lnorm_idcs] %in% c("Epithelial cells", "Endothelial cells")
+  rowMeans(exp_data_logtpm[,lnorm_idcs][, sample_cells])
+}
+))
+colnames(pseudobulk_epi_normal) <- unique(cell_anno$Sample[lnorm_idcs])
+
+pseudobulk_immune_tumor <- do.call(cbind, lapply(unique(cell_anno$Sample[ltumor_idcs]), function (s)
+{
+  sample_cells <- s == cell_anno$Sample[ltumor_idcs] & cell_anno$Cell_type[ltumor_idcs] %in% c("B lymphocytes", "MAST cells", "T lymphocytes", "Myeloid cells", "NK cells")
+  rowMeans(exp_data_logtpm[,ltumor_idcs][, sample_cells])
+}
+))
+colnames(pseudobulk_immune_tumor) <- unique(cell_anno$Sample[ltumor_idcs])
+pseudobulk_immune_normal <- do.call(cbind, lapply(unique(cell_anno$Sample[lnorm_idcs]), function (s)
+{
+  sample_cells <- s == cell_anno$Sample[lnorm_idcs] & cell_anno$Cell_type[lnorm_idcs] %in% c("B lymphocytes", "MAST cells", "T lymphocytes", "Myeloid cells", "NK cells")
+  rowMeans(exp_data_logtpm[,lnorm_idcs][, sample_cells])
+}
+))
+colnames(pseudobulk_immune_normal) <- unique(cell_anno$Sample[lnorm_idcs])
+
+
+pseudobulk <- pseudobulk_epi_tumor
+
+
+bulksex <- sample_meta$Sex[match(colnames(pseudobulk),sample_meta$Samples)]
+
+par1 <- c("PLCXD1", "GTPBP6", "PPP2R3B", "SHOX", "CRLF2", "CSF2RA", "IL3RA", "SLC25A6", "ASMTL-AS1",
+          "ASMTL", "P2RY8", "AKAP17A", "ASMT", "DHRSX", "ZBED1", "CD99")
+par2 <- c("SPRY3", "VAMP7", "IL9R", "WASH6P")
+
+y_gene_ids <- match(info_genes_tcga$gene_name, rownames(pseudobulk))
+y_gene_ids <- y_gene_ids[info_genes_tcga$seqnames == "chrY" & !(info_genes_tcga$gene_name %in% par1) & !(info_genes_tcga$gene_name %in% par2)]
+y_gene_ids <- y_gene_ids[!is.na(y_gene_ids)]
+pseudobulk_y <- pseudobulk[y_gene_ids,]
+pca_y <- prcomp(t(pseudobulk_y), center=T, scale.=F, rank.=3)
+
+LOY_sc_korea <- compute_LOY(pca_y$x, tolower(bulksex))
+
+ggsc <- ggplot(data.frame(PC1=pca_y$x[,1], PC2=pca_y$x[,2], sex=bulksex), aes(x=PC1, y=PC2, color=sex, fill=sex)) + theme_minimal()
+ggsc <- ggsc + geom_point(size=2, alpha=.7) + scale_color_viridis_d(begin=.2, end=.7)
+ggsc <- ggsc + lims(y=c(min(pca_y$x[,2]), min(pca_y$x[,2]) + (max(pca_y$x[,1]) - min(pca_y$x[,1]))))
+ggsc <- ggsc + theme(legend.title=element_blank(),
+                         legend.key.size=unit(10, 'mm'),
+                         legend.text = element_text(size=18))
+print(ggsc)
+
+auto_gene_ids <- match(info_genes_tcga$gene_name, rownames(pseudobulk))
+auto_gene_ids <- auto_gene_ids[info_genes_tcga$seqnames != "chrX" & info_genes_tcga$seqnames != "chrY"]
+auto_gene_ids <- auto_gene_ids[!is.na(auto_gene_ids)]
+# look at counts of Y along PC
+corr_plots(LOY_sc_korea, colSums(pseudobulk_y), ylab="Coverage of Y", subset=which(bulksex=="Male"), color=colSums(pseudobulk[auto_gene_ids,]))
+
+
+
+bulksex_immune <- sample_meta$Sex[match(colnames(pseudobulk_immune_tumor),sample_meta$Samples)]
+
+par1 <- c("PLCXD1", "GTPBP6", "PPP2R3B", "SHOX", "CRLF2", "CSF2RA", "IL3RA", "SLC25A6", "ASMTL-AS1",
+          "ASMTL", "P2RY8", "AKAP17A", "ASMT", "DHRSX", "ZBED1", "CD99")
+par2 <- c("SPRY3", "VAMP7", "IL9R", "WASH6P")
+
+y_gene_ids <- match(info_genes_tcga$gene_name, rownames(pseudobulk_immune_tumor))
+y_gene_ids <- y_gene_ids[info_genes_tcga$seqnames == "chrY" & !(info_genes_tcga$gene_name %in% par1) & !(info_genes_tcga$gene_name %in% par2)]
+y_gene_ids <- y_gene_ids[!is.na(y_gene_ids)]
+pseudobulk_y_imm <- pseudobulk_immune_tumor[y_gene_ids,]
+pca_y_imm <- prcomp(t(pseudobulk_y_imm), center=T, scale.=F, rank.=3)
+
+LOY_sc_korea_imm <- compute_LOY(pca_y_imm$x, tolower(bulksex_immune))
+
+ggsc <- ggplot(data.frame(PC1=pca_y_imm$x[,1], PC2=pca_y_imm$x[,2], sex=bulksex_immune), aes(x=PC1, y=PC2, color=sex, fill=sex)) + theme_minimal()
+ggsc <- ggsc + geom_point(size=2, alpha=.7) + scale_color_viridis_d(begin=.2, end=.7)
+ggsc <- ggsc + lims(y=c(min(pca_y_imm$x[,2]), min(pca_y_imm$x[,2]) + (max(pca_y_imm$x[,1]) - min(pca_y_imm$x[,1]))))
+ggsc <- ggsc + theme(legend.title=element_blank(),
+                         legend.key.size=unit(10, 'mm'),
+                         legend.text = element_text(size=18))
+print(ggsc)
+
+auto_gene_ids <- match(info_genes_tcga$gene_name, rownames(pseudobulk_immune_tumor))
+auto_gene_ids <- auto_gene_ids[info_genes_tcga$seqnames != "chrX" & info_genes_tcga$seqnames != "chrY"]
+auto_gene_ids <- auto_gene_ids[!is.na(auto_gene_ids)]
+# look at counts of Y along PC
+corr_plots(LOY_sc_korea_imm, colSums(pseudobulk_y_imm), ylab="Coverage of Y", subset=which(bulksex_immune=="Male"), color=colSums(pseudobulk[auto_gene_ids,]))
+
+
+## How many immune cells do we have in comparison to epithelial?
+pseudobulk_epi_tumor_num <- sapply(unique(cell_anno$Sample[ltumor_idcs]), function (s)
+{
+  sample_cells <- s == cell_anno$Sample[ltumor_idcs] & cell_anno$Cell_type[ltumor_idcs] %in% c("Epithelial cells", "Endothelial cells")
+  sum(sample_cells)
+}
+)
+names(pseudobulk_epi_tumor_num) <- unique(cell_anno$Sample[ltumor_idcs])
+pseudobulk_epi_normal_num <- sapply(unique(cell_anno$Sample[lnorm_idcs]), function (s)
+{
+  sample_cells <- s == cell_anno$Sample[lnorm_idcs] & cell_anno$Cell_type[lnorm_idcs] %in% c("Epithelial cells", "Endothelial cells")
+  sum(sample_cells)
+}
+)
+names(pseudobulk_epi_normal_num) <- unique(cell_anno$Sample[lnorm_idcs])
+
+pseudobulk_immune_tumor_num <- sapply(unique(cell_anno$Sample[ltumor_idcs]), function (s)
+{
+  sample_cells <- s == cell_anno$Sample[ltumor_idcs] & cell_anno$Cell_type[ltumor_idcs] %in% c("B lymphocytes", "MAST cells", "T lymphocytes", "Myeloid cells", "NK cells")
+  sum(sample_cells)
+}
+)
+names(pseudobulk_immune_tumor_num) <- unique(cell_anno$Sample[ltumor_idcs])
+pseudobulk_immune_normal_num <- sapply(unique(cell_anno$Sample[lnorm_idcs]), function (s)
+{
+  sample_cells <- s == cell_anno$Sample[lnorm_idcs] & cell_anno$Cell_type[lnorm_idcs] %in% c("B lymphocytes", "MAST cells", "T lymphocytes", "Myeloid cells", "NK cells")
+  sum(sample_cells)
+}
+)
+names(pseudobulk_immune_normal_num) <- unique(cell_anno$Sample[lnorm_idcs])
+
+
+ratios_tumor <- pseudobulk_epi_tumor_num/pseudobulk_immune_tumor_num
+
+corr_plots(LOY_sc_korea, log10(ratios_tumor), ylab="Ratio of epithelial to immune cells in tumor", subset=which(bulksex=="Male")) +
+  theme(axis.text.y = element_text(size=18),
+        axis.ticks.y = element_line(colour = "black", linewidth = 1),
+        axis.ticks.length.y = unit(8,'pt')
+        )
+
+
+## Look at proportion of T cells
+pseudobulk_t_num <- sapply(unique(cell_anno$Sample[ltumor_idcs]), function (s)
+{
+  sample_cells <- s == cell_anno$Sample[ltumor_idcs] & cell_anno$Cell_type[ltumor_idcs] %in% c("T lymphocytes")
+  sum(sample_cells)
+}
+)
+pseudobulk_t_num <- pseudobulk_t_num/pseudobulk_immune_tumor_num
+names(pseudobulk_t_num) <- unique(cell_anno$Sample[ltumor_idcs])
+
+
+corr_plots(LOY_sc_korea, pseudobulk_t_num, ylab="Ratio of T cell in immune cells", subset=which(bulksex=="Male")) +
+  theme(axis.text.y = element_text(size=18),
+        axis.ticks.y = element_line(colour = "black", linewidth = 1),
+        axis.ticks.length.y = unit(8,'pt')
+        )
+
+
+
+ratios_normal <- pseudobulk_epi_normal_num/pseudobulk_immune_normal_num
+## look at change in ratio between tumor and normal
+# match normal to tumor
+reord <- match(substr(names(ratios_tumor), 7, 8), substr(names(ratios_normal), 7, 8))
+tumkeep <- substr(names(ratios_tumor), 7, 8) %in% substr(names(ratios_normal), 7, 8)
+ratio_change <- ratios_tumor[tumkeep] - ratios_normal[reord[!is.na(reord)]]
+corr_plots(pca_y$x[tumkeep,1], ratio_change, ylab="change in ratio of epithelial to immune cells: tumor-normal", subset=which(bulksex[tumkeep]=="Male")) +
+  theme(axis.text.y = element_text(size=18),
+        axis.ticks.y = element_line(colour = "black", linewidth = 1),
+        axis.ticks.length.y = unit(8,'pt')
+        )
+
+
+corr_plots(pca_y$x[tumkeep,1], log10(ratios_normal[reord[!is.na(reord)]]), ylab="Ratio of epithelial to immune cells in normal", subset=which(bulksex=="Male")) +
+  theme(axis.text.y = element_text(size=18),
+        axis.ticks.y = element_line(colour = "black", linewidth = 1),
+        axis.ticks.length.y = unit(8,'pt')
+        )
+
+
+tumor_epi_idcs <- ltumor_idcs & cell_anno$Cell_type %in% c("Epithelial cells", "Endothelial cells")
+tumor_epi_male_idcs <- which(tumor_epi_idcs)[sample_meta$Sex[match(cell_anno$Sample[tumor_epi_idcs], sample_meta$Samples)] == 'Male']
+
+## sc LOY gene set enrichment
+# ycov <- sapply(tumor_epi_male_idcs, function(i)
+# {
+#   ## y coverage normalized by overall coverage
+#   sum(exp_data_logtpm[y_gene_ids,i])/sum(exp_data_logtpm[,i])
+# }
+# )
+# save(ycov, file="ycov_luad_add.Rdata")
+load("ycov_luad_add.Rdata")
+## see distribution of coverage
+ggplot(data.frame(cov=ycov), aes(x=cov)) + theme_minimal() + geom_histogram(bins=1000, alpha=.9) + scale_y_log10() + xlim(-0.0001,0.01)
+yloss <- ycov <= 0.0005
+
+non_y_gene_ids <- match(info_genes_tcga$gene_name, rownames(exp_data_logtpm))
+non_y_gene_ids <- non_y_gene_ids[info_genes_tcga$seqnames != "chrY"]
+non_y_gene_ids <- non_y_gene_ids[!is.na(non_y_gene_ids)]
+
+# compute logfoldchange
+logchange <- rowMeans(exp_data_logtpm[non_y_gene_ids,tumor_epi_male_idcs][,yloss]) - rowMeans(exp_data_logtpm[non_y_gene_ids,tumor_epi_male_idcs][,!yloss])
+
+logchange <- sort(logchange, decreasing=T)
+## map to ensembl
+names(logchange) <- info_genes_tcga$gene_id[match(names(logchange), info_genes_tcga$gene_name)]
+names(logchange) <- sapply(names(logchange), function(x){strsplit(x, '.', fixed=T)[[1]][1]})
+
+## GSEA
+gse <- gseGO(geneList=logchange, 
+      ont ="BP", 
+      keyType = "ENSEMBL",
+      maxGSSize = 800, 
+      pvalueCutoff = 0.05, 
+      verbose = TRUE,
+      minGSSize = 5,
+      OrgDb = organism, 
+      pAdjustMethod = "BH")
+
+gse_dat <- as.data.frame(gse)
+#write_csv(gse_dat, "sc_lung_GSEA_LOYvsNLOY_GO.csv")
+
+dotplot(gse, showCategory=10, split=".sign", font.size=6) + facet_grid(.~.sign)
+
+```
+
+
+
+## LOY estimate comparison to WGS and CNV
+
+Visiting TCGA again, we are interested in the consistency of different LOY estimates, such as based on whole genome sequencing (coverage) and copy number variations. Note that WGS-based estimates have to be computed from scratch, i.e., are not part of this repository, as they are sensitive information requiring restricted access to TCGA.
+
+[Supp. Fig. 1a,b]
+
+```{r TCGA LOY measure analysis}
+# ## Comparison to WGS
+# 
+# pathprefix <- "../data/WGS_ana"
+# 
+# files <- list.files(path = pathprefix, pattern = "gdc_counts.*", full.names = T, recursive = FALSE)
+# 
+# res <- do.call(cbind, lapply(files, function (f)
+# {
+#   dat <- read.table(f, sep=" ", header=F)[1:24, 2]
+#   return(c(sum(dat[1:22]), dat[24], sum(dat)))
+# }))
+# colnames(res) <- sapply(files, function(f) { strsplit(strsplit(f, "_", fixed=T)[[1]][7], ".", fixed=T)[[1]][1]})
+# rownames(res) <- c("auto_cov", "y_cov", "full_cov")
+# 
+# library(NetSciDataCompanion)
+# obj <- NetSciDataCompanion::CreateNetSciDataCompanionObject()
+# 
+# colnames(res) <- obj$mapUUIDtoTCGA(colnames(res))[,2]
+# 
+# ## reorder res to match PC
+# matching_wgs <- match(obj$extractSampleOnly(colnames(res)), obj$extractSampleOnly(colnames(TCGA_TPM_filtered_ge)))
+# 
+# cov_dat <- data.frame(LOY=LOY_metric[matching_wgs],
+#                       relative_coverage=res[2,]/res[3,],
+#                       autosomal_coverage=res[1,]/max(res[1,], na.rm=T))
+# cov_dat <- cov_dat[cov_dat$autosomal_coverage > .6,]
+# 
+# corr_pear <- round(cor(cov_dat$LOY, cov_dat$relative_coverage, use="complete.obs", method="pearson"), digits=3)
+# corr_spear <- round(cor(cov_dat$LOY, cov_dat$relative_coverage, use="complete.obs", method="spearman"), digits=3)
+# 
+# ggTCGA <- ggplot(cov_dat,
+#                  aes(x=LOY, y=relative_coverage, color=autosomal_coverage)) + theme_minimal()
+# ggTCGA <- ggTCGA + geom_point(size=1, alpha=.7) + scale_color_viridis()
+# ggTCGA <- ggTCGA + annotate("text", x = (min(cov_dat$LOY, na.rm=T) + 0.6*(max(cov_dat$LOY, na.rm=T) - min(cov_dat$LOY, na.rm=T))), y = max(cov_dat$relative_coverage, na.rm=T) , label = paste0("Pearson: ", corr_pear), size=6)
+# ggTCGA <- ggTCGA + annotate("text", x = (min(cov_dat$LOY, na.rm=T) + 0.6*(max(cov_dat$LOY, na.rm=T) - min(cov_dat$LOY, na.rm=T))), y = min(cov_dat$relative_coverage, na.rm=T) + 0.95*(max(cov_dat$relative_coverage, na.rm=T) -  min(cov_dat$relative_coverage, na.rm=T)), label = paste0("Spearman: ", corr_spear), size=6) + labs(y="WGS-based LOY estimate")
+# ggTCGA <- ggTCGA + theme(legend.title=element_blank(),
+#                          legend.key.size=unit(10, 'mm'),
+#                          legend.text = element_text(size=18))
+# print(ggTCGA)
+# 
+# print(cor.test(cov_dat$LOY, cov_dat$relative_coverage, method="pearson", alternative="two.sided"))
+
+
+## Comparison to CNV-based estimates
+query.luad.nocnv <- GDCquery(project = "TCGA-LUAD",
+                            data.category = "Copy Number Variation",
+                            legacy = F,
+                            file.type = "grch38.seg",
+                            data.type = "Copy Number Segment",
+                            sample.type = c("Primary Tumor"))
+
+GDCdownload(query.luad.nocnv)
+
+luad.nocnv <- GDCprepare(query.luad.nocnv, save = TRUE, save.filename = "LUADnocnvhg19.rda")
+
+y_cnv <- sapply(unique(luad.nocnv$Sample), function (tcga_id)
+{
+  luad.nocnv.sub <- luad.nocnv[luad.nocnv$Sample == tcga_id,]
+  mean(luad.nocnv.sub[luad.nocnv.sub$Chromosome == "Y",]$Segment_Mean)
+})
+names(y_cnv) <- unique(luad.nocnv$Sample)
+names(y_cnv) <- str_replace_all(names(y_cnv), '\\.', '-')
+names(y_cnv) <- substr(names(y_cnv), 1, 12)
+auto_cnv <- sapply(unique(luad.nocnv$Sample), function (tcga_id)
+{
+  luad.nocnv.sub <- luad.nocnv[luad.nocnv$Sample == tcga_id,]
+  mean(luad.nocnv.sub[!(luad.nocnv.sub$Chromosome %in% c("X","Y")),]$Segment_Mean)
+})
+names(auto_cnv) <- names(y_cnv)
+dat <- data.frame(LOY=LOY_metric,
+                  Y_CNV=y_cnv[match(substr(colnames(TCGA_TPM_filtered_ge), 1, 12), names(y_cnv))],
+                  row.names=colnames(TCGA_TPM_filtered_ge),
+                  sex=sex_tcga)
+
+ggTCGA <- ggplot(dat, aes(x=LOY, y=Y_CNV, color=sex)) + theme_minimal()
+ggTCGA <- ggTCGA + geom_point(size=1, alpha=.5) + labs(y="CNV-based LOY estimate")
+print(ggTCGA)
+
+
+corr_pear <- round(cor(dat[dat$sex == 'male',]$LOY, dat[dat$sex == 'male',]$Y_CNV, use="complete.obs", method="pearson"), digits=3)
+corr_spear <- round(cor(dat[dat$sex == 'male',]$LOY, dat[dat$sex == 'male',]$Y_CNV, use="complete.obs", method="spearman"), digits=3)
+
+ggTCGA <- ggplot(dat[dat$sex == 'male',], aes(x=LOY, y=Y_CNV)) + theme_minimal()
+ggTCGA <- ggTCGA + geom_point(size=1, alpha=.5) #+ lims(x=c(-2, -1.5))
+ggTCGA <- ggTCGA + annotate("text", x = (min(dat[dat$sex == 'male',]$LOY, na.rm=T) + 0.6*(max(dat[dat$sex == 'male',]$LOY, na.rm=T) - min(dat[dat$sex == 'male',]$LOY, na.rm=T))), y = max(dat[dat$sex == 'male',]$Y_CNV, na.rm=T) , label = paste0("Pearson: ", corr_pear), size=6)
+ggTCGA <- ggTCGA + annotate("text", x = (min(dat[dat$sex == 'male',]$LOY, na.rm=T) + 0.6*(max(dat[dat$sex == 'male',]$LOY, na.rm=T) - min(dat[dat$sex == 'male',]$LOY, na.rm=T))), y = min(dat[dat$sex == 'male',]$Y_CNV, na.rm=T) + 0.95*(max(dat[dat$sex == 'male',]$Y_CNV, na.rm=T) -  min(dat[dat$sex == 'male',]$Y_CNV, na.rm=T)), label = paste0("Spearman: ", corr_spear), size=6) + labs(y="CNV-based LOY estimate")
+ggTCGA <- ggTCGA + theme(legend.title=element_blank(),
+                         legend.key.size=unit(10, 'mm'),
+                         legend.text = element_text(size=18))
+print(ggTCGA)
+
+
+print(cor.test(dat[dat$sex == 'male',]$LOY, dat[dat$sex == 'male',]$Y_CNV, method="pearson", alternative="two.sided"))
+```
+
+
+## Gene regulatory networks (TIGERs) for males in LUAD TCGA
+
+We provide the pre-computed TIGER GRN based on Dorothea, the following analysis is based on this network.
+
+[Fig. 3f; 4b, Supp Fig. 6a]
+
+
+```{r Tiger TCGA}
+
+corr_plots_basic <- function(X, Val, ylab="Value Y", xlab="Value X", subset=NA)
+{
+  if (anyNA(subset))
+  {
+    subset <- 1:length(X)
+  }
+  corr_pear <- round(cor(X[subset], Val[subset], use="complete.obs", method="pearson"), digits=3)
+  corr_spear <- round(cor(X[subset], Val[subset], use="complete.obs", method="spearman"), digits=3)
+  ggTCGA <- ggplot(data.frame(X=X,Y=Val)[subset,], aes(x=X, y=Y)) + theme_minimal()
+  ggTCGA <- ggTCGA + geom_point(size=.7, alpha=.7) + labs(y=ylab, x=xlab)  + scale_color_viridis_d()
+  ggTCGA <- ggTCGA + annotate("text", x = (min(X[subset], na.rm=T) + 0.6*(max(X[subset], na.rm=T) - min(X[subset], na.rm=T))), y = max(Val[subset], na.rm=T), label = paste0("Pearson: ", corr_pear))
+  ggTCGA <- ggTCGA + annotate("text", x = (min(X[subset], na.rm=T) + 0.6*(max(X[subset], na.rm=T) - min(X[subset], na.rm=T))), y = 0.95*max(Val[subset], na.rm=T), label = paste0("Spearman: ", corr_spear))
+  return(ggTCGA)
+}
+
+
+## Analysis of male-only TIGER
+tigers <- readRDS('../data/TIGER/luad_male_tiger_dorothea.rds')
+
+reg_mat <- setNames(lapply(1:length(tigers$sample.name), function(sample_idx)
+{
+  dat <- do.call(cbind, lapply(1:length(tigers$TF.name), function(tf_idx)
+  {
+    tigers$Z[tf_idx, sample_idx] * tigers$W[, tf_idx]
+  }))
+  rownames(dat) <- tigers$TG.name
+  colnames(dat) <- tigers$TF.name
+  return(dat)
+}), tigers$sample.name)
+## remove duplicates
+reg_mat <- reg_mat[!duplicated(substr(names(reg_mat),1,12))]
+reg_mat_loy <- LOY_metric[match(substr(names(reg_mat),1,12), substr(colnames(TCGA_TPM_filtered_ge), 1, 12))]
+names(reg_mat_loy) <- substr(colnames(TCGA_TPM_filtered_ge), 1, 12)[match(substr(names(reg_mat),1,12), substr(colnames(TCGA_TPM_filtered_ge), 1, 12))]
+
+
+gene_agg_mat <- setNames(lapply(1:length(tigers$sample.name), function(sample_idx)
+{
+  dat <- rowSums(do.call(cbind, lapply(1:length(tigers$TF.name), function(tf_idx)
+  {
+    tigers$Z[tf_idx, sample_idx] * tigers$W[, tf_idx]
+  })))
+  names(dat) <- tigers$TG.name
+  return(dat)
+}), tigers$sample.name)
+gene_agg_mat <- as.data.frame(gene_agg_mat, check.names=F)
+
+## check correlation between sample specific regulatory gene expression scores and actual gene expression
+TCGA_TPM_TIGERmatch <- TCGA_TPM_filtered_ge[match(rownames(gene_agg_mat), info_genes_tcga$gene_name[keep]),
+                                            match(colnames(gene_agg_mat), colnames(TCGA_TPM_filtered_ge))]
+cors_tiger_ge <- sapply(1:nrow(TCGA_TPM_TIGERmatch), function(i)
+{
+  cor(TCGA_TPM_TIGERmatch[i,], as.matrix(gene_agg_mat)[i,], method='pearson', use='complete.obs')
+})
+
+gg <- ggplot(data.frame(correlations=cors_tiger_ge), aes(x=correlations)) + theme_minimal()
+gg <- gg + geom_freqpoly(bins=50)
+
+
+dat <- setNames(sapply(1:length(tigers$TG.name), function(gene_idx)
+{
+  cor(reg_mat_loy, unlist(gene_agg_mat[gene_idx, ]), use="complete.obs")
+}), tigers$TG.name)
+k <- 1000
+topk_reg <-  dat[order(abs(dat), decreasing=T)[1:k]]
+info_genes_tcga$gene_id_nover <- sapply(info_genes_tcga$gene_id, function(x){strsplit(x, '.', fixed=T)[[1]][1]})
+topk_reg_ensg <- info_genes_tcga$gene_id_nover[match(names(topk_reg), info_genes_tcga$gene_name)]
+
+library(biomaRt)
+library(clusterProfiler)
+mart <- useDataset("hsapiens_gene_ensembl", useMart("ensembl"))
+genesMap <- getBM(
+  filters="ensembl_gene_id",
+  attributes=c("ensembl_gene_id", "entrezgene_id"),
+  uniqueRows = T,
+  useCache=F,
+  values=topk_reg_ensg,
+  mart=mart)
+genesMapFull <- getBM(
+  filters="ensembl_gene_id",
+  attributes=c("ensembl_gene_id", "entrezgene_id"),
+  uniqueRows = T,
+  useCache=F,
+  values=info_genes_tcga$gene_id_nover[match(tigers$TG.name, info_genes_tcga$gene_name)],
+  mart=mart)
+keggAnalysis <- enrichKEGG(genesMap[,2],
+                           organism     = 'hsa',
+                           pvalueCutoff = .05,
+                           universe = as.character(genesMapFull[,2]),
+                           minGSSize = 5)
+as.data.frame(keggAnalysis@result)
+goAnalysis <- enrichGO(genesMap[,2],
+                       'org.Hs.eg.db',
+                       ont="BP",
+                       pvalueCutoff = .05,
+                       universe = as.character(genesMapFull[,2]),
+                       minGSSize = 5)
+as.data.frame(goAnalysis@result)
+
+
+CTAs <- ct_genes
+
+## standard immune related markers
+IMMs <- c("IFNG", "TAP1",
+          "CCL5", "CXCL9", "CXCL10", "SOX2",
+          # from here https://www-science-org.ezp-prod1.hul.harvard.edu/doi/10.1126/science.aaf8399
+          "GZMA", "GZMB", "GZMH", "GZMK", "GZMM",
+          "CD3E", "CD3D", "CD3G", "CD247",
+          "JAK2", "IRF1", "IRF2", "GBP4", "GBP5", "CIITA",
+          "IL1B", "IL16", "IL-18", "CCL4", "CCL3", "CCL19", "CCL7", "CCL11", "CCL22", "CCL13")
+
+
+## make heatmap of CT antigens
+library(classInt)
+cint <- classIntervals(reg_mat_loy, 7, style="equal")
+box_flag <- cut(reg_mat_loy, cint$brks, labels=as.character(1:7), include.lowest = T)
+
+CTA_cors <- setNames(sapply(1:length(ct_genes), function (idx)
+{
+  if (sum(rownames(gene_agg_mat) == ct_genes[idx]) == 0)
+  {
+    return(NA)
+  }
+  cor(unlist(gene_agg_mat[match(ct_genes[idx], rownames(gene_agg_mat)), ]), reg_mat_loy, use="complete.obs")
+}), ct_genes)
+
+CTA_sig <- setNames(sapply(1:length(ct_genes), function (idx)
+{
+  if (sum(rownames(gene_agg_mat) == ct_genes[idx]) == 0)
+  {
+    return(NA)
+  }
+  cor.test(unlist(gene_agg_mat[match(ct_genes[idx], rownames(gene_agg_mat)), ]),
+           reg_mat_loy,
+           method='pearson',
+           alternative='two.sided')$p.value
+}), ct_genes)
+CTA_sig <- p.adjust(CTA_sig, method='hochberg')
+print(names(CTA_sig)[which(CTA_sig < .05)])
+
+reg_mat_ct <- gene_agg_mat[match(names(CTA_sig)[which(CTA_sig < .05)], rownames(gene_agg_mat)),]
+reg_mat_norm_ct <- t(apply(reg_mat_ct, 1, function(x)(x-min(x))/(max(x)-min(x))))
+
+data <- do.call(rbind, lapply(levels(box_flag), function (loy_bin)
+{
+  data.frame(regulation=rowMeans(reg_mat_norm_ct[,box_flag == loy_bin]),
+             loy_bin=rep(loy_bin, nrow(reg_mat_norm_ct)),
+             CT_antigen=rownames(reg_mat_norm_ct),
+             CT_corr=CTA_cors[which(CTA_sig < .05)])
+}))
+data$CT_antigen <- factor(data$CT_antigen, levels = names(CTA_sig)[which(CTA_sig < .05)])
+require(viridis)
+gg <- ggplot(data, aes(x=loy_bin, y=CT_antigen, fill=regulation)) + theme_minimal()
+gg <- gg + geom_tile() + scale_fill_viridis() + labs(x="binned LOY", y="CTA")
+print(gg)
+
+## look at change of regulation of CT antigens
+gene_name <- "PRAME"
+dat <- data.frame(avg_reg=colMeans(gene_agg_mat[which(rownames(gene_agg_mat) %in% gene_name), ]),
+                  loy=reg_mat_loy)
+corr_plots_basic(dat$loy, dat$avg_reg, xlab = "Loss of Y", ylab=paste0("Regulation of ", gene_name))
+gene_name <- "TTK"
+dat <- data.frame(avg_reg=colMeans(gene_agg_mat[which(rownames(gene_agg_mat) %in% gene_name), ]),
+                  loy=reg_mat_loy)
+corr_plots_basic(dat$loy, dat$avg_reg, xlab = "Loss of Y", ylab=paste0("Regulation of ", gene_name))
+gene_name <- "XAGE1B"
+dat <- data.frame(avg_reg=colMeans(gene_agg_mat[which(rownames(gene_agg_mat) %in% gene_name), ]),
+                  loy=reg_mat_loy)
+corr_plots_basic(dat$loy, dat$avg_reg, xlab = "Loss of Y", ylab=paste0("Regulation of ", gene_name))
+gene_name <- "SPAG9"
+dat <- data.frame(avg_reg=colMeans(gene_agg_mat[which(rownames(gene_agg_mat) %in% gene_name), ]),
+                  loy=reg_mat_loy)
+corr_plots_basic(dat$loy, dat$avg_reg, xlab = "Loss of Y", ylab=paste0("Regulation of ", gene_name))
+
+
+
+sig_CTAs <- names(CTA_sig)[which(CTA_sig < .05)]
+#sig_CTAs <- c("XAGE1B", "TTK", "TMEM108", "TEX15", "SSX4B", "SSX2", "SPEF2", "SPAG8", "SPAG6", "SPAG17", "RGS22",
+#              "PRAME", "POTEG", "PBK", "OIP5", "NLRP4", "MAGEA10", "IL13RA2", "HSPB9", "GPAT2", "FBXO39", "CCDC33",
+#              "CABYR", "ATAD2", "ADAM29")
+
+
+
+#### Analysis of Caris immunotherapy data in light of found CTAs
+
+cta_survival_pembro <- as.data.frame(read_excel("../data/immunotherapy/HR and p for pembro, nivo, atezo and all three.xlsx", sheet = 'Pembrolizumab'))
+cta_survival_atezo <- as.data.frame(read_excel("../data/immunotherapy/HR and p for pembro, nivo, atezo and all three.xlsx", sheet = 'Atezolizumab'))
+cta_survival_nivo <- as.data.frame(read_excel("../data/immunotherapy/HR and p for pembro, nivo, atezo and all three.xlsx", sheet = 'Nivolumab'))
+colnames(cta_survival_pembro)[1] <- 'gene_name'
+colnames(cta_survival_atezo)[1] <- 'gene_name'
+colnames(cta_survival_nivo)[1] <- 'gene_name'
+
+sig_pembro <- as.numeric(cta_survival_pembro[cta_survival_pembro$gene_name %in% sig_CTAs, 10]) < .05
+sig_pembro[is.na(sig_pembro)] <- F
+cta_survival_pembro[cta_survival_pembro$gene_name %in% sig_CTAs, 1][sig_pembro]
+sig_atezo <- as.numeric(cta_survival_atezo[cta_survival_atezo$gene_name %in% sig_CTAs, 10]) < .05
+sig_atezo[is.na(sig_atezo)] <- F
+cta_survival_atezo[cta_survival_atezo$gene_name %in% sig_CTAs, 1][sig_atezo]
+sig_nivo <- as.numeric(cta_survival_nivo[cta_survival_nivo$gene_name %in% sig_CTAs, 10]) < .05
+sig_nivo[is.na(sig_nivo)] <- F
+cta_survival_nivo[cta_survival_nivo$gene_name %in% sig_CTAs, 1][sig_nivo]
+
+
+pembro_conf <- strsplit(cta_survival_pembro[cta_survival_pembro$gene_name %in% sig_CTAs,]$`HR Confidence Interval_75_Percentile`, '-', fixed=T)
+atezo_conf <- strsplit(cta_survival_atezo[cta_survival_atezo$gene_name %in% sig_CTAs,]$`HR Confidence Interval_75_Percentile`, '-', fixed=T)
+nivo_conf <- strsplit(cta_survival_nivo[cta_survival_nivo$gene_name %in% sig_CTAs,]$`HR Confidence Interval_75_Percentile`, '-', fixed=T)
+
+res <- data.frame(conf_min=as.numeric(c(sapply(pembro_conf, function(x){x[1]}),
+                             sapply(atezo_conf, function(x){x[1]}),
+                             sapply(nivo_conf, function(x){x[1]}))),
+                  conf_max=as.numeric(c(sapply(pembro_conf, function(x){x[2]}),
+                             sapply(atezo_conf, function(x){x[2]}),
+                             sapply(nivo_conf, function(x){x[2]}))),
+                  HR=c(as.numeric(cta_survival_pembro[cta_survival_pembro$gene_name %in% sig_CTAs,]$HR_75_Percentile),
+                         as.numeric(cta_survival_atezo[cta_survival_atezo$gene_name %in% sig_CTAs,]$HR_75_Percentile),
+                         as.numeric(cta_survival_nivo[cta_survival_nivo$gene_name %in% sig_CTAs,]$HR_75_Percentile)
+                  ),
+                  drug=rep(c('Pembrolizumab', 'Atezolizumab', 'Nivolumab'), each=sum(cta_survival_pembro$gene_name %in% sig_CTAs)),
+                  pval=c(as.numeric(cta_survival_pembro[cta_survival_pembro$gene_name %in% sig_CTAs,]$`P-Value_75_Percentile`),
+                         as.numeric(cta_survival_atezo[cta_survival_atezo$gene_name %in% sig_CTAs,]$`P-Value_75_Percentile`),
+                         as.numeric(cta_survival_nivo[cta_survival_nivo$gene_name %in% sig_CTAs,]$`P-Value_75_Percentile`)
+                  ),
+                  CTA=rep(cta_survival_pembro$gene_name[cta_survival_pembro$gene_name %in% sig_CTAs], 3)
+                  )
+res <- res[!is.na(res$pval),]
+res$alpha <- ifelse(res$pval < .05, 1, .5)
+res$pval[res$pval >= .05] <- NA
+
+## make CTA forest plots
+library(dplyr)
+library(ggplot2)
+library(forcats)
+
+forest <- res %>%
+  ggplot(aes(x=CTA, y=HR, ymin=conf_min, ymax=conf_max, alpha=alpha, group=drug, color=drug)) + 
+  theme_minimal() +
+  scale_color_viridis_d() +
+  scale_x_discrete(expand=c(.05,0)) +
+  geom_pointrange(lwd=0.8, position=position_dodge(width = 1)) + 
+  geom_hline(aes(yintercept = 1), lty=2) +
+  xlab("") + ylab("hazard ratio") +
+  guides(fill = guide_legend(reverse = TRUE)) +
+  geom_text(aes(label=signif(pval, 2)), vjust = 'left', hjust='bottom', size=4,
+            color='black', position=position_dodge(width = 1)) +
+  coord_flip() +  # flip coordinates (puts labels on y axis)
+  theme(axis.title = element_text(face = "bold"),
+        axis.text = element_text(face = "bold", size = 11),
+        strip.text = element_text(face = "bold"),
+        plot.margin = unit(c(1, 1, 1, 1), "lines"),
+        title = element_text(face = "bold", size = 12),
+        strip.text.x = element_blank(),#element_text(face = "bold", size = 12),
+        strip.text.y = element_blank(),
+        legend.text = element_text(face = "bold", size = 12),
+        legend.box = 'vertical') + theme(legend.position="none")
+  labs(subtitle="Hazard ratio after treatment")
+
+print(forest)
+
+
+forest <- res[res$drug=="Pembrolizumab",] %>%
+  ggplot(aes(x=CTA, y=HR, ymin=conf_min, ymax=conf_max, alpha=alpha)) + 
+  theme_minimal() +
+  scale_color_viridis_d() +
+  scale_x_discrete(expand=c(.05,0)) +
+  geom_pointrange(lwd=0.8, position=position_dodge(width = 1)) + 
+  geom_hline(aes(yintercept = 1), lty=2) +
+  xlab("") + ylab("hazard ratio") +
+  guides(fill = guide_legend(reverse = TRUE)) +
+  geom_text(aes(label=signif(pval, 2)), vjust = 'left', hjust='bottom', size=4,
+            color='black', position=position_dodge(width = 1)) +
+  coord_flip() +  # flip coordinates (puts labels on y axis)
+  theme(axis.title = element_text(face = "bold"),
+        axis.text = element_text(face = "bold", size = 11),
+        strip.text = element_text(face = "bold"),
+        plot.margin = unit(c(1, 1, 1, 1), "lines"),
+        title = element_text(face = "bold", size = 12),
+        strip.text.x = element_blank(),#element_text(face = "bold", size = 12),
+        strip.text.y = element_blank(),
+        legend.text = element_text(face = "bold", size = 12),
+        legend.box = 'vertical') + theme(legend.position="none")
+  labs(subtitle="Hazard ratio after treatment")
+
+print(forest)
+
+```
+
+
+## Active subnetwork extraction
+
+The following code extracts the relevant information from TIGER networks to be used for active subnetwork identification.
+
+```{r active subnet prep}
+
+tigers <- readRDS('../data/TIGER/luad_male_tiger_dorothea.rds')
+
+reg_mat <- setNames(lapply(1:length(tigers$sample.name), function(sample_idx)
+{
+  dat <- do.call(cbind, lapply(1:length(tigers$TF.name), function(tf_idx)
+  {
+    tigers$Z[tf_idx, sample_idx] * tigers$W[, tf_idx]
+  }))
+  rownames(dat) <- tigers$TG.name
+  colnames(dat) <- tigers$TF.name
+  return(dat)
+}), tigers$sample.name)
+## remove duplicates
+reg_mat <- reg_mat[!duplicated(substr(names(reg_mat),1,12))]
+reg_mat_loy <- LOY_metric[match(substr(names(reg_mat),1,12), substr(colnames(TCGA_TPM_filtered_ge), 1, 12))]
+names(reg_mat_loy) <- substr(colnames(TCGA_TPM_filtered_ge), 1, 12)[match(substr(names(reg_mat),1,12), substr(colnames(TCGA_TPM_filtered_ge), 1, 12))]
+
+gene_agg_mat <- setNames(lapply(1:length(tigers$sample.name), function(sample_idx)
+{
+  dat <- rowSums(do.call(cbind, lapply(1:length(tigers$TF.name), function(tf_idx)
+  {
+    tigers$Z[tf_idx, sample_idx] * tigers$W[, tf_idx]
+  })))
+  names(dat) <- tigers$TG.name
+  return(dat)
+}), tigers$sample.name)
+gene_agg_mat <- as.data.frame(gene_agg_mat, check.names=F)
+
+## extract node-level features
+node_info_genes <- setNames(sapply(1:length(tigers$TG.name), function(gene_idx)
+{
+  cor(reg_mat_loy, unlist(gene_agg_mat[gene_idx, ]), use="complete.obs")
+}), tigers$TG.name)
+node_info_genes_pval <- setNames(sapply(1:length(tigers$TG.name), function(gene_idx)
+{
+  cor.test(reg_mat_loy, unlist(gene_agg_mat[gene_idx, ]), use="complete.obs")$p.value
+}), tigers$TG.name)
+
+node_info_tfs <- setNames(sapply(1:length(tigers$TF.name), function(tf_idx)
+{
+  cor(reg_mat_loy, unlist(tigers$Z[tf_idx, ]), use="complete.obs")
+}), tigers$TF.name)
+node_info_tfs_pval <- setNames(sapply(1:length(tigers$TF.name), function(tf_idx)
+{
+  cor.test(reg_mat_loy, unlist(tigers$Z[tf_idx, ]), use="complete.obs")$p.value
+}), tigers$TF.name)
+
+## extract network part
+network <- tigers$W
+
+save(node_info_genes, node_info_genes_pval, node_info_tfs, node_info_tfs_pval, network, file='../data/activesubnet_info.Rdata')
+
+```
+
+
+## Analysis of active subnetworks
+
+[Supp. Fig. 5]
+
+```{r active subnet ana}
+load("../data/kate_activesubnet_info.rdata")
+
+top_left = matrix(0,ncol=735,nrow=735)
+bottom_right = matrix(0,nrow=16856,ncol=16856)
+colnames(network) = paste0(colnames(network),"-tf")
+row.names(network) = paste0(row.names(network),"-gene")
+adj_mat = cbind(rbind(top_left,network),rbind(t(network),bottom_right))
+
+adj_graph = graph_from_adjacency_matrix(adj_mat,
+                                        weighted=T,
+                                        mode="undirected",
+                                        diag=F)
+
+names(node_info_tfs_pval) = paste0(names(node_info_tfs_pval),"-tf")
+names(node_info_genes_pval) = paste0(names(node_info_genes_pval),"-gene")
+
+names(node_info_tfs) = paste0(names(node_info_tfs),"-tf")
+names(node_info_genes) = paste0(names(node_info_genes),"-gene")
+
+node_p_vals = c(node_info_tfs_pval,node_info_genes_pval)
+node_reg_scores = c(node_info_tfs,node_info_genes)
+
+set.seed(1989)
+bum = fitBumModel(node_p_vals)
+node_scores = BioNet::scoreNodes(adj_graph, bum, fdr=5e-5)
+bionet_mod = BioNet::runFastHeinz(adj_graph,node_scores)
+length(V(bionet_mod))
+sum(node_scores > 0)
+# 337
+
+# take the bionet_mod graph as an edgelist
+bionet_edgelist = as_edgelist(bionet_mod) %>% 
+  data.frame()
+
+# run a basic over-representation analysis on the set of genes included
+active_genes = unique(str_remove(bionet_edgelist$X2,"-gene"))
+universe_genes = str_remove(names(node_info_genes),"-gene")
+
+# gene set from https://www.gsea-msigdb.org/gsea/msigdb/download_file.jsp?filePath=/msigdb/release/2023.2.Hs/c2.cp.v2023.2.Hs.symbols.gmt
+cp_gene_sets = gmtPathways("../ext/c2.cp.v2023.2.Hs.symbols.gmt")
+reactome_gene_sets = cp_gene_sets[grep("REACTOME",names(cp_gene_sets))]
+active_gene_ora = fora(pathways = cp_gene_sets,
+                       genes = active_genes,
+                       universe = universe_genes)
+  
+# reimpose the GRN edge weights
+bionet_edgelist$reg_edge_weight=NA
+for(i in 1:nrow(bionet_edgelist))
+{
+  gene_idx = which(rownames(network) == bionet_edgelist[i,]$X2)
+  tf_idx = which(colnames(network) == bionet_edgelist[i,]$X1)
+  bionet_edgelist[i,]$reg_edge_weight = network[gene_idx,tf_idx] 
+}
+
+# add the regulatory network edges back in
+bionet_weighted_graph = graph_from_edgelist(as.matrix(bionet_edgelist[,1:2]))
+E(bionet_weighted_graph)$reg_edge_weight = bionet_edgelist$reg_edge_weight
+E(bionet_weighted_graph)$pos_reg_edge_weight = ifelse(bionet_edgelist$reg_edge_weight > 0,
+                                                      bionet_edgelist$reg_edge_weight, 0)
+E(bionet_weighted_graph)$neg_reg_edge_weight = ifelse(bionet_edgelist$reg_edge_weight < 0,
+                                                      bionet_edgelist$reg_edge_weight, 0)
+
+# calculate centrality measures (maybe not appropriate for bipartite graph)
+bionet_measures = data.frame("strength" = strength(bionet_weighted_graph,
+                                                   weights =abs(E(bionet_weighted_graph)$reg_edge_weight)),
+                             "positive_strength" = strength(bionet_weighted_graph,
+                                                            weights = E(bionet_weighted_graph)$pos_reg_edge_weight),
+                             "negative_strength" = strength(bionet_weighted_graph,
+                                                            weights=abs(E(bionet_weighted_graph)$neg_reg_edge_weight)),
+                             "hub_score" = hub_score(bionet_weighted_graph, 
+                                                     weights = abs(E(bionet_weighted_graph)$reg_edge_weight))$vector,
+                             "betweenness" = betweenness(bionet_weighted_graph, weights = 1/abs(E(bionet_weighted_graph)$reg_edge_weight)))
+                             
+bionet_measures$node = row.names(bionet_measures)
+
+# add node attributes to convert to bipartite network
+V(bionet_weighted_graph)$type = FALSE
+V(bionet_weighted_graph)$type[grep("-tf",V(bionet_weighted_graph)$name)] = TRUE
+
+score_df = data.frame("node"=V(bionet_weighted_graph)$name) %>%
+ left_join(data.frame("node"=names(node_p_vals),
+                      "p_loy_assoc" = node_p_vals,
+                      "FDR_loy_assoc"=p.adjust(node_p_vals,method="BH")),by="node") %>%
+ left_join(data.frame("node"=names(node_scores),
+                      "score_bum_loy"=node_scores),by="node") %>%
+ left_join(data.frame("node"=names(node_reg_scores),
+                      "node_loy_assoc"=node_reg_scores),by="node")
+
+sum(V(bionet_weighted_graph)$name != score_df$node)
+V(bionet_weighted_graph)$score_bum_loy = score_df$score_bum_loy
+V(bionet_weighted_graph)$node_loy_assoc = score_df$node_loy_assoc
+
+tfs_graph_idx = grep("-tf",V(bionet_weighted_graph)$name)
+
+jpeg("loy_reg_net.jpeg",width=8,height=10,units="in",res=300)
+
+#par(mar=c(0,0,0,0)+.1)
+LO = layout_as_bipartite(bionet_weighted_graph,
+                         hgap=10,vgap=10)
+LO[tfs_graph_idx,1]=seq(from=3500,to=500,length.out=10)
+LO[-tfs_graph_idx,1]=seq(from=4000,to=0,length.out=200)
+#LO[-tfs_graph_idx,2] = LO[-tfs_graph_idx,2] + rnorm(n=length(tfs_graph_idx))
+plot(bionet_weighted_graph,
+     asp=2,
+     layout=LO[,2:1],
+     vertex.size = ifelse(V(bionet_weighted_graph)$type==T,25,4), 
+     edge.arrow.size = 0,
+     edge.color = ifelse(E(bionet_weighted_graph)$reg_edge_weight > 0, "red","blue"),
+     edge.width = 2*abs(E(bionet_weighted_graph)$reg_edge_weight),
+     vertex.label.degree = pi,
+     vertex.label.dist = 7,
+     #vertex.label.size=3,
+     vertex.label.color="black",
+     vertex.label = ifelse(V(bionet_weighted_graph)$type == "FALSE",NA,V(bionet_weighted_graph)$name),
+     vertex.color = ifelse(V(bionet_weighted_graph)$node_loy_assoc > 0, "red4","royalblue"))
+
+dev.off()
+
+all_tf_nbhds = list()
+for(i in 1:length(tfs_graph_idx))
+{
+  this_graph = make_ego_graph(bionet_weighted_graph, 1,V(bionet_weighted_graph)$name[tfs_graph_idx[i]])
+  all_tf_nbhds[[i]] = this_graph
+  names(all_tf_nbhds)[[i]] = V(bionet_weighted_graph)$name[tfs_graph_idx[i]]
+}
+
+circle_plot = function(mygraph,mytitle="My Graph")
+{
+  radian.rescale <- function(x, start=0, direction=1) {
+    c.rotate <- function(x) (x + start) %% (2 * pi) * direction
+    c.rotate(scales::rescale(x, c(0, 2 * pi), range(x)))
+  }
+  n = length(V(mygraph))
+  V(mygraph)$type = F
+  V(mygraph)$type[grep("-gene",V(mygraph)$name)] = T
+  print(table(V(mygraph)$type))
+  lab.locs <- radian.rescale(x=1:n, direction=-1, start=0)
+  LO = layout_as_bipartite(mygraph,hgap=20,vgap=20)
+  plot(mygraph,layout = LO[,2:1], #layout_as_bipartite,
+       asp=2,
+     #vertex.label.degree=lab.locs,
+     vertex.size = ifelse(V(mygraph)$score_bum_loy>0,2*V(mygraph)$score_bum_loy,0), 
+     edge.arrow.size = 0.5,
+     edge.color = ifelse(E(mygraph)$reg_edge_weight > 0, "red","blue"),
+     edge.width = 3*abs(E(mygraph)$reg_edge_weight),
+     vertex.label.dist = ifelse(V(mygraph)$type==T,3,-2),
+     vertex.label.color="black",
+     vertex.label.cex=ifelse(V(mygraph)$type==T,0.5,1),
+     vertex.label.degree=ifelse(V(mygraph)$type==T,pi,pi/2),
+     #vertex.label.size=3,
+     vertex.label = str_remove(V(mygraph)$name,"-gene"), # ifelse(V(mygraph)$type == "FALSE",NA,V(bionet_weighted_graph)$name),
+     vertex.color = ifelse(V(mygraph)$node_loy_assoc > 0, "red4","royalblue"))
+  title(mytitle)
+  }
+
+#ZHX2 and GATA3
+pdf("tf_nbhds.pdf",width=5,height=10)
+par(mfrow=c(1,1))
+for(i in 1:length(all_tf_nbhds))
+{
+  print(i)
+  circle_plot(all_tf_nbhds[[i]][[1]],mytitle=names(all_tf_nbhds)[[i]])
+}
+dev.off()
+
+table(V(bionet_weighted_graph)$node_loy_assoc > 0)
+# 201     9
+sum(E(bionet_weighted_graph)$reg_edge_weight > 0)
+#215
+sum(E(bionet_weighted_graph)$reg_edge_weight < 0)
+#18
+length(E(bionet_weighted_graph))
+#233
+
+measures_and_scores = bionet_measures %>% left_join(score_df,by="node")
+table_paper = measures_and_scores %>% filter(grepl("tf",node)) %>%
+  select(node,strength,positive_strength, 
+         negative_strength,node_loy_assoc,p_loy_assoc,FDR_loy_assoc) %>% 
+  arrange(-strength)
+table_paper[,2:5] = round(table_paper[,2:5],2)
+table_paper$p_loy_assoc = formatC(table_paper$p_loy_assoc, format = "e", digits = 2)
+table_paper$FDR_loy_assoc = formatC(table_paper$FDR_loy_assoc, format = "e", digits = 2)
+
+names(table_paper)=c("Node","Absolute Weighted Degree","Positive Degree","Negative Degree","LOY Effect","LOY p","LOY FDR")
+write.table(table_paper,file="table_paper.asv",
+            sep="&",quote=F)
+
+jpeg("cytochrome_p450_paths.jpeg",width=12,height=4,units="in",res=300)
+par(mfrow=c(1,3))
+# pull out subnets for some of the enriched pathways
+kegg_drug_metabolism_cytochrome_p450 = c("ADH1B", 
+                                         "ADH1C", 
+                                         "ADH5", 
+                                         "CYP2A13", 
+                                         "FMO5", 
+                                         "GSTA3", 
+                                         "MAOA")
+
+wp_cytochrome_p450 = c("CYP2A13", 
+                       "CYP4A11", 
+                       "CYP4A22", 
+                       "CYP4B1", 
+                       "CYP4V2", 
+                       "CYP4X1")
+
+reactome_cytochrome_p450 = c("ARNT2",
+                             "CYP2A13", 
+                             "CYP4A11", 
+                             "CYP4A22", 
+                             "CYP4B1", 
+                             "CYP4V2")
+
+this_graph = make_ego_graph(bionet_weighted_graph, 
+                            order=1,
+                            nodes = paste(kegg_drug_metabolism_cytochrome_p450,"-gene",sep=""))
+
+whole_graph = do.call(union, this_graph)
+V(whole_graph)$type = F
+V(whole_graph)$type[grep("-tf",V(whole_graph)$name)] = T
+my_layout = layout_as_bipartite(whole_graph)
+plot(whole_graph,
+     layout = my_layout[,2:1],
+     vertex.color="white",
+     vertex.size=4,vertex.label.dist=2,
+     vertex.label.degree=-90)
+title("KEGG Drug Metabolism Cytochrome p450")
+
+this_graph = make_ego_graph(bionet_weighted_graph, 
+                            order=1,
+                            nodes = paste(wp_cytochrome_p450,"-gene",sep=""))
+
+whole_graph = do.call(union, this_graph)
+V(whole_graph)$type = F
+V(whole_graph)$type[grep("-tf",V(whole_graph)$name)] = T
+my_layout = layout_as_bipartite(whole_graph)
+plot(whole_graph,
+     layout = my_layout[,2:1],
+     vertex.color="white",
+     vertex.size=4,vertex.label.dist=2,
+     vertex.label.degree=-90)
+title("WikiPathways Oxidation by Cytochrome p450")
+
+
+this_graph = make_ego_graph(bionet_weighted_graph, 
+                            order=1,
+                            nodes = paste(reactome_cytochrome_p450,"-gene",sep=""))
+
+whole_graph = do.call(union, this_graph)
+V(whole_graph)$type = F
+V(whole_graph)$type[grep("-tf",V(whole_graph)$name)] = T
+my_layout = layout_as_bipartite(whole_graph)
+plot(whole_graph,
+     layout = my_layout[,2:1],
+     vertex.color="white",
+     vertex.size=4,vertex.label.dist=2,
+     vertex.label.degree=-90)
+title("Reactome Cytochrome p450")
+dev.off()
+
+```
+
+
+
+## Immunotherapy treatment response
+
+For immunotherapy treatment response data from Caris, we provide a forest plot for RPS4Y1-based 50-percentile split to obtain hazard ratio per treatment (ratio between high- and low-expression group)
+
+[Supp. Fig. 6b]
+
+```{r rps4y1 forest}
+
+data <- data.frame(treatment = c('Pembrolizumab', 'Nivolumab', 'Atezolizumab'),
+                   perc_50 = c(0.830785950913472, 0.987513903806861, 1.15639505858772),
+                   int_min = c(0.72222, 0.69314, 0.64811),
+                   int_max = c(0.95568, 1.4069, 2.06331),
+                   significance = paste0("p=", round(c(0.00949705257371905, 0.9525410153819, 0.614341854506343), 3)),
+                   n = paste0("n=",c(832, 125, 55)))
+
+gg <- ggplot(data, aes(x=treatment, y=perc_50,
+                                  ymin=int_min, ymax=int_max)) +
+  geom_hline(yintercept=1.0, color="darkgrey") +
+  theme_minimal() + geom_pointrange(lwd=0.8, position=position_dodge(width = 1)) +
+  scale_color_viridis_d() + ylab('Hazard Ratio (HR) LOY vs nLOY') + xlab('') +
+  geom_text(aes(label=n), nudge_y=-0.05, nudge_x=.2) +
+  geom_text(aes(label=significance), nudge_y=0.05, nudge_x=.2) +
+  theme(axis.title = element_text(face = "bold"),
+        axis.text = element_text(face = "bold", size = 11),
+        strip.text = element_text(face = "bold"),
+        strip.text.x = element_blank(),#element_text(face = "bold", size = 12),
+        strip.text.y = element_blank(),
+        legend.text = element_text(face = "bold", size = 12),
+        legend.box = 'vertical')
+print(gg)
+
+```
+
+
