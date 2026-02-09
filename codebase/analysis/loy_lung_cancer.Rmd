@@ -321,6 +321,12 @@ gg <- ggplot(data.frame(RPS4Y1=TCGA_TPM_filtered_ge[info_genes_tcga$gene_name[ke
 
 print(gg)
 
+## Additional lm analysis for RPS4Y1
+rps4y1_exp <- TCGA_TPM_filtered_ge[info_genes_tcga$gene_name[keep] %in% c('RPS4Y1'), sex_tcga=='male']
+loy_tcga <- LOY_metric[sex_tcga=='male']
+lm_rps4y1 <- lm(loy_tcga ~ rps4y1_exp)
+summary(lm_rps4y1)
+
 ```
 
 
@@ -439,13 +445,40 @@ corr_plots(LOY_metric, dat$ABSOLUTE, ylab="Purity given by ABSOLUTE", subset=whi
 corr_plots(LOY_metric, dat$CPE, ylab="Purity given by CPE", subset=which(sex_tcga == "male")) + labs(x="LOY")
 
 
+
 print(cor.test(info_samples_tcga$tcga.gdc_cases.diagnoses.age_at_diagnosis[sex_tcga=='male'], LOY_metric[sex_tcga=='male'], method='pearson'))
 print(cor.test(info_samples_tcga$tcga.gdc_cases.exposures.cigarettes_per_day[sex_tcga=='male'], LOY_metric[sex_tcga=='male'], method='pearson'))
 print(cor.test(info_samples_tcga$tcga.gdc_cases.exposures.years_smoked[sex_tcga=='male'], LOY_metric[sex_tcga=='male'], method='pearson'))
 print(cor.test(LOY_metric[sex_tcga=='male'], dat$ESTIMATE[sex_tcga=='male'], method='pearson'))
+print(cor.test(LOY_metric[sex_tcga=='male'], dat$CPE[sex_tcga=='male'], method='pearson'))
 ```
 
+## Senitivity analysis based on purity filter stringency
 
+To investigate whether tumor purity of samples has an effect on LOY estimates, e.g. due to overall stromal cell content,
+we study the correlation between LOY estimates based on different stringency filters when filtering using ESTIMATE purity predictions.
+
+```{r purity sensitivity}
+
+res_pur <- lapply(c(.2, .4, .6), function(x){
+  
+  filter_pur <- dat$ESTIMATE > x # cut at 0.2 0.4 0.6
+  filter_pur[is.na(filter_pur)] <- F
+  
+  ## compute PCs on original gene expression data
+  pc_data_tcga <- prcomp(t(TCGA_TPM_filtered[,filter_pur]), scale=F, center=T, rank=3)
+  ## project data down onto PCs
+  projected_tcga <- scale(t(TCGA_TPM_filtered[,filter_pur]), center=pc_data_tcga$center, scale=pc_data_tcga$scale) %*% pc_data_tcga$rotation 
+
+  
+  LOY_metric <- compute_LOY(projected_tcga, sex_tcga[filter_pur])
+})
+
+res_pur_2 <- res_pur[[1]][match(names(res_pur[[3]]),names(res_pur[[1]]))]
+res_pur_4 <- res_pur[[2]][match(names(res_pur[[3]]),names(res_pur[[2]]))]
+res_pur_6 <- res_pur[[3]]
+
+```
 
 ## The role of cancer testis antigenes in the trajectory of LOY
 
@@ -497,6 +530,26 @@ info_genes_tcga$gene_name[sapply(strsplit(info_genes_tcga$gene_id, '.', fixed=T)
 
 
 print(summary(m))
+
+cleaned_geneids <- sapply(strsplit(info_genes_tcga$gene_id[keep], '.', fixed=T), function(x){x[1]})
+
+
+sry_lm <- lm(TCGA_TPM_filtered_ge[info_genes_tcga$gene_name[keep] %in% c('SRY'), sex_tcga=='male'] ~ t(TCGA_TPM_filtered_ge[cleaned_geneids %in% YToTestis_binding[YToTestis_binding[,1] == "SRY",2], sex_tcga=='male']))
+summary(sry_lm)
+
+hsfy2_lm <- lm(TCGA_TPM_filtered_ge[info_genes_tcga$gene_name[keep] %in% c('HSFY2'), sex_tcga=='male'] ~ t(TCGA_TPM_filtered_ge[cleaned_geneids %in% YToTestis_binding[YToTestis_binding[,1] == "HSFY2",2], sex_tcga=='male']))
+summary(hsfy2_lm)
+
+# are the CTFs with binding sites expressed in LOY versus with Y?
+loy_cors <- lapply(YToTestis_binding[YToTestis_binding[,1] == "HSFY2",2], function (g)
+{
+thresh <- 0.7
+hihi <- median(TCGA_TPM_filtered_ge[cleaned_geneids %in% c(g), sex_tcga=='male'][LOY_metric[sex_tcga=='male']>thresh])
+lolo <- median(TCGA_TPM_filtered_ge[cleaned_geneids %in% c(g), sex_tcga=='male'][LOY_metric[sex_tcga=='male']<=thresh])
+names(hihi) <- names(lolo) <- g
+list(high_loy=hihi,
+     low_loy=lolo)
+})
 ```
 
 
