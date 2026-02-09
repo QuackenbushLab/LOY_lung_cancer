@@ -11,13 +11,13 @@ All shareable data is deposited under "data/", containing intermediate results f
 
 [BiorXiv](https://www.biorxiv.org/content/10.1101/2024.09.19.613876v2)
 
-@article {Fischer:LOYLUAD,
-	author = {Fischer, Jonas and Shutta, Katherine H. and Chen, Chen and Fanfani, Viola and Saha, Enakshi and Mandros, Panagiotis and Guebila, Marouen Ben and Xiu, Joanne and Nieva, Jorge and Liu, Stephen and Uprety, Dipesh and Spetzler, David and Lopes-Ramos, Camila M. and DeMeo, Dawn L. and Quackenbush, John},
-	title = {Selective loss of Y chromosomes in lung adenocarcinoma modulates the tumor immune environment through cancer/testis antigens},
-	year = {2025},
-	doi = {10.1101/2024.09.19.613876},
-	publisher = {Cold Spring Harbor Laboratory},
-	URL = {https://www.biorxiv.org/content/early/2025/11/05/2024.09.19.613876},
-	journal = {bioRxiv}
+@article {Fischer:LOYLUAD,\
+	author = {Fischer, Jonas and Shutta, Katherine H. and Chen, Chen and Fanfani, Viola and Saha, Enakshi and Mandros, Panagiotis and Guebila, Marouen Ben and Xiu, Joanne and Nieva, Jorge and Liu, Stephen and Uprety, Dipesh and Spetzler, David and Lopes-Ramos, Camila M. and DeMeo, Dawn L. and Quackenbush, John},\
+	title = {Selective loss of Y chromosomes in lung adenocarcinoma modulates the tumor immune environment through cancer/testis antigens},\
+	year = {2025},\
+	doi = {10.1101/2024.09.19.613876},\
+	publisher = {Cold Spring Harbor Laboratory},\
+	URL = {https://www.biorxiv.org/content/early/2025/11/05/2024.09.19.613876},\
+	journal = {bioRxiv}\
 }
 
